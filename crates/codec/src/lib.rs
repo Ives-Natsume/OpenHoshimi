@@ -1,4 +1,4 @@
-//! Frame-format decoders for OpenHoshimi.
+//! Frame-format decoders for ClosedHoshimi.
 //!
 //! Decoders here turn the raw bytes of a [`openhoshimi_core::Frame`] into
 //! a structured representation specific to one framing protocol
@@ -29,7 +29,7 @@ pub use ccsds_concat::{
     CcsdsConcatDecoder, CcsdsConcatFrame, RsBasis, CCSDS_ASM, CCSDS_CONCAT_CODED_BITS,
 };
 pub use cw::{CwAnalyzer, CwAnalyzerConfig, DEFAULT_CW_TONE_HZ, DEFAULT_ENVELOPE_RATE_HZ};
-pub use fec::{ReedSolomon, Viterbi};
+pub use fec::{ReedSolomon, StreamingViterbi, Viterbi};
 pub use geoscan::{
     GeoscanDecoder, GeoscanFrame, GEOSCAN_CRC_LEN, GEOSCAN_FRAME_LEN, GEOSCAN_PAYLOAD_LEN,
 };

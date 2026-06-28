@@ -7,7 +7,7 @@ use rayon::prelude::*;
 
 use openhoshimi_codec::{
     ax100_syncword, Ao40FecDecoder, Ax100Decoder, Ax100Mode, Ax25Decoder, Ax25Frame, Callsign,
-    GeoscanDecoder, GeoscanFrame, SsdvDecoder,
+    CcsdsConcatDecoder, GeoscanDecoder, GeoscanFrame, SsdvDecoder,
 };
 use openhoshimi_core::satellite::{
     Ax100ModeDef, CodecDef, CpmModeDef, DescramblerDef, DownlinkDef, FramerDef, LineCodingDef,
@@ -202,7 +202,7 @@ pub fn frame_type_for_codec(downlink: &DownlinkDef) -> FrameType {
         Some(CodecKind::Ax25) => FrameType::Ax25,
         Some(CodecKind::Ao40Fec) => FrameType::Ao40Fec,
         Some(CodecKind::GomspaceAx100(_)) => FrameType::GomspaceAx100,
-        Some(CodecKind::Ccsds) => FrameType::Ccsds,
+        Some(CodecKind::CcsdsConcat { .. }) => FrameType::Ccsds,
         Some(CodecKind::Geoscan) => FrameType::Geoscan,
         Some(CodecKind::Ssdv) => FrameType::Ssdv,
         Some(CodecKind::Unknown) | None => FrameType::Unknown,
@@ -718,7 +718,7 @@ pub fn prepare_linear_iq_setup_scored_with_progress(
         {
             #[cfg(debug_assertions)]
             eprintln!(
-                "openhoshimi: candidate={candidate:+.1} Hz -> frames={} sync_distance={:?}",
+                "closedhoshimi: candidate={candidate:+.1} Hz -> frames={} sync_distance={:?}",
                 result.frames, result.sync_distance,
             );
             let mut aligned_downlink = downlink.clone();
@@ -883,6 +883,17 @@ where
     demodulator: Option<Box<dyn Demodulator<Sample = S>>>,
     line_decoder: Option<Box<dyn LineDecoder>>,
     descrambler: Option<Box<dyn Descrambler>>,
+    /// Optional streaming Viterbi decoder inserted between the demodulator
+    /// and the framer for CCSDS concatenated downlinks. The ASM is
+    /// convolutionally encoded, so the framer must operate on the Viterbi
+    /// output rather than the raw channel symbols.
+    inner_viterbi: Option<openhoshimi_codec::StreamingViterbi>,
+    /// NRZ-S (differential) decode state for CCSDS concatenated downlinks
+    /// with differential precoding. Applied to the Viterbi output before
+    /// the framer (matching the gr-satellites ccsds_rs_deframer topology:
+    /// Viterbi -> diff_decode -> ASM detect). `Some(last_bit)` carries the
+    /// previous bit across `push_samples` batches; `None` disables it.
+    inner_nrzs: Option<u8>,
     framer: FrameStage,
     codec: CodecStage,
     total_samples: u64,
@@ -954,10 +965,27 @@ where
 {
     /// Build a pipeline from a downlink definition.
     pub fn new(downlink: &DownlinkDef) -> Result<Self, String> {
+        let ccsds_concat = match codec_kind(downlink) {
+            Some(CodecKind::CcsdsConcat {
+                frame_size,
+                differential,
+            }) => Some((frame_size, differential)),
+            _ => None,
+        };
+        let inner_viterbi = ccsds_concat.map(|_| openhoshimi_codec::StreamingViterbi::new());
+        // For CCSDS concatenated with differential precoding, NRZ-S decode
+        // runs on the Viterbi output before the framer (gr-satellites
+        // topology). The codec then only descrambles + RS-decodes.
+        let inner_nrzs = match ccsds_concat {
+            Some((_, true)) => Some(0u8),
+            _ => None,
+        };
         Ok(Self {
             demodulator: None,
             line_decoder: build_line_decoder(downlink)?,
             descrambler: build_descrambler(downlink)?,
+            inner_viterbi,
+            inner_nrzs,
             framer: build_framer(downlink)?,
             codec: build_codec(downlink)?,
             total_samples: 0,
@@ -983,13 +1011,34 @@ where
             descrambler.descramble(&mut bits);
         }
         self.total_bits = self.total_bits.saturating_add(bits.len() as u64);
+
+        // For CCSDS concatenated, run the streaming Viterbi decoder on the
+        // channel symbols before the framer. The ASM is convolutionally
+        // encoded, so the framer must detect it in the Viterbi output.
+        if let Some(viterbi) = self.inner_viterbi.as_mut() {
+            bits = viterbi.push_symbols(&bits);
+        }
+
+        // NRZ-S (differential) decode the Viterbi output before the framer,
+        // carrying the last bit across batches. This matches the
+        // gr-satellites topology (Viterbi -> diff_decode -> ASM detect) and
+        // resolves the BPSK 180-degree phase ambiguity (XOR of consecutive
+        // bits is invariant to global inversion).
+        if let Some(prev) = self.inner_nrzs.as_mut() {
+            for bit in bits.iter_mut() {
+                let cur = *bit & 1;
+                *bit = cur ^ *prev;
+                *prev = cur;
+            }
+        }
+
         // Prefer soft-decision syncword detection when no per-bit transform
-        // (line decoder, descrambler) sits between the demodulator and the
-        // framer. The soft buffer from the demodulator is 1:1 aligned with
-        // `bits`, so it carries the same content but with confidence info
-        // the correlator can use to lock onto bursts the hard Hamming
-        // detector misses.
-        let frames = if self.line_decoder.is_none() && self.descrambler.is_none() {
+        // (line decoder, descrambler, inner Viterbi) sits between the
+        // demodulator and the framer.
+        let frames = if self.line_decoder.is_none()
+            && self.descrambler.is_none()
+            && self.inner_viterbi.is_none()
+        {
             let soft = demodulator.last_soft();
             if soft.len() == bits.len() {
                 self.framer
@@ -1451,7 +1500,13 @@ fn codec_kind(downlink: &DownlinkDef) -> Option<CodecKind> {
             Ax100ModeDef::AsmGolayCrc => Ax100Mode::AsmGolayCrc,
         })),
         Some(CodecDef::Unknown) => Some(CodecKind::Unknown),
-        Some(CodecDef::Ccsds) => Some(CodecKind::Ccsds),
+        Some(CodecDef::CcsdsConcat {
+            frame_size,
+            differential,
+        }) => Some(CodecKind::CcsdsConcat {
+            frame_size: *frame_size,
+            differential: *differential,
+        }),
         Some(CodecDef::Geoscan) => Some(CodecKind::Geoscan),
         Some(CodecDef::Ssdv) => Some(CodecKind::Ssdv),
         Some(CodecDef::Fx25) => None,
@@ -1473,7 +1528,10 @@ enum CodecKind {
     Ax25,
     Ao40Fec,
     GomspaceAx100(Ax100Mode),
-    Ccsds,
+    CcsdsConcat {
+        frame_size: usize,
+        differential: bool,
+    },
     Geoscan,
     Ssdv,
     Unknown,
@@ -1486,7 +1544,7 @@ enum CodecStage {
         decoder: Ax100Decoder,
         mode: Ax100Mode,
     },
-    Ccsds,
+    CcsdsConcat(CcsdsConcatDecoder),
     Geoscan(GeoscanDecoder),
     Ssdv(SsdvDecoder),
     Unknown,
@@ -1590,7 +1648,20 @@ impl CodecStage {
                     .map_err(|err| format!("SSDV decode failed: {err}"))?;
                 Ok(DecodedFrame::Ssdv(packet))
             }
-            Self::Ccsds | Self::Unknown => Ok(DecodedFrame::Raw {
+            Self::CcsdsConcat(decoder) => {
+                // The streaming Viterbi decoder already ran in the pipeline,
+                // so frame.raw contains the Viterbi-decoded RS codeword (255
+                // bytes). Use decode_frame_bytes which does differential +
+                // descramble + RS.
+                let decoded = decoder
+                    .decode_frame_bytes(&frame.raw)
+                    .map_err(|err| format!("CCSDS Concatenated decode failed: {err}"))?;
+                Ok(DecodedFrame::Ao40 {
+                    payload: decoded.payload,
+                    corrected_errors: decoded.corrected_errors,
+                })
+            }
+            Self::Unknown => Ok(DecodedFrame::Raw {
                 frame_type: frame.frame_type,
                 raw_len: frame.raw.len(),
             }),
@@ -1606,7 +1677,17 @@ fn build_codec(downlink: &DownlinkDef) -> Result<CodecStage, String> {
             decoder: Ax100Decoder::new(),
             mode,
         }),
-        Some(CodecKind::Ccsds) => Ok(CodecStage::Ccsds),
+        Some(CodecKind::CcsdsConcat {
+            frame_size,
+            differential: _,
+        }) => Ok(CodecStage::CcsdsConcat(CcsdsConcatDecoder::new(
+            frame_size,
+            // NRZ-S precoding (if any) is undone by the pipeline's
+            // `inner_nrzs` stage on the Viterbi output before the framer,
+            // so the codec never differential-decodes the codeword.
+            false,
+            openhoshimi_codec::RsBasis::Conventional,
+        ))),
         Some(CodecKind::Geoscan) => Ok(CodecStage::Geoscan(GeoscanDecoder::new())),
         Some(CodecKind::Ssdv) => Ok(CodecStage::Ssdv(SsdvDecoder::new())),
         Some(CodecKind::Unknown) => Ok(CodecStage::Unknown),
@@ -1690,7 +1771,7 @@ impl SoftAo40Pipeline {
             let abs_sum: u64 = frame.iter().map(|&s| i64::from(s).unsigned_abs()).sum();
             let mean_abs = abs_sum as f32 / frame.len() as f32;
             eprintln!(
-                "openhoshimi: ao40 frame stats: len={} ones={}/{} ({:.1}%) transitions={}/{} ({:.1}%) mean_abs_soft={:.1}",
+                "closedhoshimi: ao40 frame stats: len={} ones={}/{} ({:.1}%) transitions={}/{} ({:.1}%) mean_abs_soft={:.1}",
                 frame.len(),
                 ones,
                 frame.len(),
@@ -1711,7 +1792,7 @@ impl SoftAo40Pipeline {
                         Ok(payload) => format!("hard OK ({} corrected)", payload.corrected_errors),
                         Err(hard_err) => format!("hard ERR {hard_err}"),
                     };
-                    eprintln!("openhoshimi: soft Ao40 frame decode failed: {err}; {hard_summary}");
+                    eprintln!("closedhoshimi: soft Ao40 frame decode failed: {err}; {hard_summary}");
                     if let Ok(payload) = hard_result {
                         decoded.push(DecodedFrame::Ao40 {
                             payload: payload.payload,

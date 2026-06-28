@@ -335,8 +335,16 @@ pub enum CodecDef {
         /// AX100 decoder mode.
         mode: Ax100ModeDef,
     },
-    /// CCSDS frame decoder placeholder.
-    Ccsds,
+    /// CCSDS Concatenated codec (Viterbi r=1/2 K=7 inner + RS(255,223)
+    /// outer). Used by ASRTU-1 (AO-123) and other CCSDS TM satellites.
+    CcsdsConcat {
+        /// Payload size after RS decoding (typically 223).
+        #[serde(default = "default_ccsds_frame_size")]
+        frame_size: usize,
+        /// Apply differential decoding after Viterbi.
+        #[serde(default = "default_true")]
+        differential: bool,
+    },
     /// FX.25 frame decoder placeholder.
     Fx25,
     /// Geoscan custom frame decoder (CC11xx PN9 descrambling +
@@ -753,6 +761,14 @@ fn default_interleave() -> usize {
 
 fn default_ax100_asm_threshold() -> usize {
     4
+}
+
+fn default_ccsds_frame_size() -> usize {
+    223
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_image_width() -> u32 {

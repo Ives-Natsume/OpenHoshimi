@@ -80,6 +80,233 @@ impl Fec for Viterbi {
     }
 }
 
+/// Streaming Viterbi decoder for continuous channel symbol streams.
+///
+/// Unlike the block-mode [`Viterbi`] decoder, this maintains internal state
+/// across calls to [`push_symbols`](Self::push_symbols), enabling continuous
+/// decoding of an unsegmented symbol stream (e.g. CCSDS TM where the ASM is
+/// convolutionally encoded alongside the data).
+///
+/// Uses a fixed traceback depth of 5×(K-1) = 30 steps. Output is delayed by
+/// the traceback depth.
+#[derive(Debug, Clone)]
+pub struct StreamingViterbi {
+    /// Path metrics for each state.
+    metrics: [u32; 64],
+    /// Circular buffer of decisions (one per step, up to traceback depth).
+    decisions: Vec<[u8; 64]>,
+    /// Current write position in the circular buffer.
+    write_pos: usize,
+    /// Number of steps accumulated (saturates at traceback depth).
+    accumulated: usize,
+    /// Pending output bit from an odd-symbol input.
+    pending_symbol: Option<u8>,
+}
+
+const STREAMING_TRACEBACK: usize = 35;
+
+impl Default for StreamingViterbi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamingViterbi {
+    /// Create a new streaming Viterbi decoder starting in state 0.
+    pub fn new() -> Self {
+        let mut metrics = [viterbi::INF; 64];
+        metrics[0] = 0;
+        Self {
+            metrics,
+            decisions: vec![[0u8; 64]; STREAMING_TRACEBACK],
+            write_pos: 0,
+            accumulated: 0,
+            pending_symbol: None,
+        }
+    }
+
+    /// Push hard-decision channel symbols (one bit per byte, 0 or 1) and
+    /// return decoded bits. Output is delayed by the traceback depth.
+    pub fn push_symbols(&mut self, symbols: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for &sym in symbols {
+            if let Some(first) = self.pending_symbol.take() {
+                let received = [first & 1, sym & 1];
+                output.extend(self.step(received));
+            } else {
+                self.pending_symbol = Some(sym);
+            }
+        }
+        output
+    }
+
+    /// Process one symbol pair and return 0 or 1 decoded bits.
+    fn step(&mut self, received: [u8; 2]) -> Option<u8> {
+        let mut next_metrics = [viterbi::INF; 64];
+        let decisions = &mut self.decisions[self.write_pos];
+
+        for (state, &metric) in self.metrics.iter().enumerate() {
+            if metric == viterbi::INF {
+                continue;
+            }
+            for bit in 0..=1u8 {
+                let next_state = ((state << 1) | usize::from(bit)) & 63;
+                let encoded = viterbi::encode_branch(state as u8, bit);
+                let branch_metric = u32::from(viterbi::hamming2_pub(received, encoded));
+                let candidate = metric + branch_metric;
+                if candidate < next_metrics[next_state] {
+                    next_metrics[next_state] = candidate;
+                    decisions[next_state] = (state as u8) | (bit << 6);
+                }
+            }
+        }
+
+        // Normalize metrics to prevent overflow.
+        let min_metric = next_metrics.iter().copied().min().unwrap_or(0);
+        if min_metric > 0 {
+            for m in next_metrics.iter_mut() {
+                if *m != viterbi::INF {
+                    *m -= min_metric;
+                }
+            }
+        }
+
+        self.metrics = next_metrics;
+        self.write_pos = (self.write_pos + 1) % STREAMING_TRACEBACK;
+        self.accumulated += 1;
+
+        if self.accumulated >= STREAMING_TRACEBACK {
+            Some(self.traceback())
+        } else {
+            None
+        }
+    }
+
+    /// Trace back from the best current state to produce one output bit.
+    fn traceback(&self) -> u8 {
+        let mut state = self
+            .metrics
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, m)| *m)
+            .map(|(s, _)| s)
+            .unwrap_or(0);
+
+        let mut bit = 0u8;
+        let mut pos = if self.write_pos == 0 {
+            STREAMING_TRACEBACK - 1
+        } else {
+            self.write_pos - 1
+        };
+
+        for i in 0..STREAMING_TRACEBACK {
+            let decision = self.decisions[pos][state];
+            if i == STREAMING_TRACEBACK - 1 {
+                bit = (decision >> 6) & 1;
+            }
+            state = usize::from(decision & 0x3f);
+            pos = if pos == 0 {
+                STREAMING_TRACEBACK - 1
+            } else {
+                pos - 1
+            };
+        }
+        bit
+    }
+}
+
+#[cfg(test)]
+mod streaming_viterbi_tests {
+    use super::*;
+
+    #[test]
+    fn streaming_matches_block_decoder() {
+        // Encode a known bit sequence, then verify the streaming decoder
+        // produces the same output as the block decoder (after the
+        // traceback delay settles).
+        let bits: Vec<u8> = (0..200u8).map(|i| u8::from(i % 5 == 0)).collect();
+        let symbols = viterbi::encode_bits(&bits);
+
+        let block_decoded = viterbi::decode_bits(&symbols).expect("block decode");
+
+        let mut streaming = StreamingViterbi::new();
+        let stream_decoded = streaming.push_symbols(&symbols);
+
+        // The streaming decoder has a traceback delay, so the first
+        // STREAMING_TRACEBACK bits are delayed. Compare the overlapping
+        // region.
+        let skip = STREAMING_TRACEBACK;
+        assert!(
+            stream_decoded.len() + skip >= bits.len(),
+            "streaming output too short: {} + {} < {}",
+            stream_decoded.len(),
+            skip,
+            bits.len()
+        );
+
+        // The streaming output (after delay) should match the block output.
+        let compare_len = stream_decoded.len().min(block_decoded.len() - skip);
+        assert_eq!(
+            &stream_decoded[..compare_len],
+            &block_decoded[skip..skip + compare_len],
+            "streaming and block decoders disagree"
+        );
+    }
+
+    #[test]
+    fn streaming_decodes_concatenated_frames() {
+        // Simulate the CCSDS concatenated structure: [ASM][data][ASM][data]
+        // convolutionally encoded as a continuous stream.
+        let asm: Vec<u8> = {
+            let asm_u32: u32 = 0x1ACF_FC1D;
+            (0..32).rev().map(|i| ((asm_u32 >> i) & 1) as u8).collect()
+        };
+
+        let frame_data: Vec<u8> = (0..255u8)
+            .flat_map(|b| (0..8).rev().map(move |i| (b >> i) & 1))
+            .collect();
+
+        // Build two frames: [ASM][data][ASM][data]
+        let mut info_stream = Vec::new();
+        info_stream.extend_from_slice(&asm);
+        info_stream.extend_from_slice(&frame_data);
+        info_stream.extend_from_slice(&asm);
+        info_stream.extend_from_slice(&frame_data);
+
+        // Convolutionally encode the entire stream.
+        let channel_symbols = viterbi::encode_bits(&info_stream);
+
+        // Streaming Viterbi decode.
+        let mut decoder = StreamingViterbi::new();
+        let decoded = decoder.push_symbols(&channel_symbols);
+
+        // After the traceback delay, the decoded stream should contain
+        // the original [ASM][data][ASM][data] pattern.
+        let skip = STREAMING_TRACEBACK;
+        assert!(
+            decoded.len() > skip + 32 + 2040,
+            "decoded stream too short for ASM + frame"
+        );
+
+        // Find the ASM in the decoded stream.
+        let asm_pattern: u32 = 0x1ACF_FC1D;
+        let mut found = 0;
+        for i in 0..decoded.len().saturating_sub(32) {
+            let mut word = 0u32;
+            for j in 0..32 {
+                word = (word << 1) | u32::from(decoded[i + j] & 1);
+            }
+            if word == asm_pattern {
+                found += 1;
+            }
+        }
+        assert!(
+            found >= 2,
+            "expected at least 2 ASM detections, got {found}"
+        );
+    }
+}
+
 /// CRC-32C (Castagnoli) used by libcsp / GOMspace AX100 frames.
 ///
 /// Reflected input/output, init `0xFFFF_FFFF`, final XOR `0xFFFF_FFFF`,
@@ -193,7 +420,7 @@ pub(crate) mod viterbi {
     const K: usize = 7;
     const G1: u8 = 0x4f;
     const G2: u8 = 0x6d;
-    const INF: u32 = u32::MAX / 4;
+    pub(crate) const INF: u32 = u32::MAX / 4;
     const SECOND_SYMBOL_INVERTED: bool = true;
 
     pub(crate) fn decode_bits(symbols: &[u8]) -> Result<Vec<u8>, DecodeError> {
@@ -339,7 +566,7 @@ pub(crate) mod viterbi {
         out
     }
 
-    fn encode_branch(state: u8, bit: u8) -> [u8; 2] {
+    pub(crate) fn encode_branch(state: u8, bit: u8) -> [u8; 2] {
         let register = ((state << 1) | (bit & 1)) & ((1 << K) - 1);
         let second = if SECOND_SYMBOL_INVERTED {
             parity(register & G2) ^ 1
@@ -351,6 +578,10 @@ pub(crate) mod viterbi {
 
     fn parity(value: u8) -> u8 {
         (value.count_ones() & 1) as u8
+    }
+
+    pub(crate) fn hamming2_pub(received: [u8; 2], expected: [u8; 2]) -> u8 {
+        hamming2(received, expected)
     }
 
     fn hamming2(received: [u8; 2], expected: [u8; 2]) -> u8 {

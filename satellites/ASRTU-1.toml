@@ -1,0 +1,63 @@
+# ASRTU-1 / AO-123 / RS64S (NORAD 61781)
+#
+# Association of Siberian and Far Eastern Radio Technical Universities.
+# 9k6 DBPSK CCSDS Concatenated (Viterbi r=1/2 + RS(255,223)) on UHF.
+# SSDV images on 436.210 MHz, telemetry on 435.400 MHz.
+#
+# References:
+#   https://db.satnogs.org/satellite/KGEF-8685-2681-9687-2264
+#   https://community.libre.space/t/ssdv-fm-rs64s-asrtu-1/12729
+#   gr-satellites: python/satyaml/ASRTU-1.yml
+
+[satellite]
+name = "ASRTU-1"
+aliases = ["AO-123", "RS64S", "BJ2CR"]
+norad_id = 61781
+
+[[downlink]]
+label = "9k6 DBPSK telemetry"
+freq_hz = 435_400_000
+modulation = "BPSK"
+baudrate = 9600
+framing = "CCSDS_CONCAT"
+
+[downlink.modem]
+kind = "linear"
+mode = "bpsk"
+
+[downlink.framer]
+kind = "syncword"
+# CCSDS ASM 0x1ACFFC1D in MSB-first binary (32 bits).
+# Detected in the Viterbi-decoded domain (the ASM is convolutionally
+# encoded alongside the data).
+syncword = "00011010110011111111110000011101"
+threshold = 4
+# RS(255,223) codeword = 255 bytes = 2040 bits (in Viterbi-decoded domain)
+payload_bits = 2040
+
+[downlink.codec]
+kind = "ccsds_concat"
+frame_size = 223
+differential = true
+
+[[downlink]]
+label = "9k6 BPSK SSDV images"
+freq_hz = 436_210_000
+modulation = "BPSK"
+baudrate = 9600
+framing = "CCSDS_CONCAT"
+
+[downlink.modem]
+kind = "linear"
+mode = "bpsk"
+
+[downlink.framer]
+kind = "syncword"
+syncword = "00011010110011111111110000011101"
+threshold = 4
+payload_bits = 2040
+
+[downlink.codec]
+kind = "ccsds_concat"
+frame_size = 223
+differential = true

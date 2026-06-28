@@ -53,7 +53,7 @@ threshold = 2
 payload_bits = 488
 
 [downlink.codec]
-kind = "ccsds"
+kind = "unknown"
 
 # ----------------------------------------------------------------------------
 # 9k6 GMSK SSDV image downlink.
