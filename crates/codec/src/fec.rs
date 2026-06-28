@@ -99,13 +99,36 @@ pub struct StreamingViterbi {
     write_pos: usize,
     /// Number of steps accumulated (saturates at traceback depth).
     accumulated: usize,
+    /// Per-step reliability margin (second-best minus best survivor metric),
+    /// indexed identically to `decisions`. Used to derive a soft-output
+    /// confidence for each emitted bit (a SOVA-style approximation).
+    margins: Vec<u32>,
     /// Pending hard symbol from an odd-length `push_symbols` input.
     pending_symbol: Option<u8>,
     /// Pending soft symbol from an odd-length `push_soft_symbols` input.
     pending_soft: Option<i8>,
+    /// Reliability (path-metric margin) for each bit emitted by the most
+    /// recent `push_soft_symbols` call, aligned 1:1 with its output. Larger
+    /// values mean the trellis decision was less ambiguous.
+    last_reliabilities: Vec<u32>,
 }
 
 const STREAMING_TRACEBACK: usize = 35;
+
+/// Return the smallest and second-smallest values in `metrics`.
+fn two_smallest(metrics: &[u32; 64]) -> (u32, u32) {
+    let mut min = u32::MAX;
+    let mut second = u32::MAX;
+    for &m in metrics.iter() {
+        if m < min {
+            second = min;
+            min = m;
+        } else if m < second {
+            second = m;
+        }
+    }
+    (min, second)
+}
 
 impl Default for StreamingViterbi {
     fn default() -> Self {
@@ -121,11 +144,21 @@ impl StreamingViterbi {
         Self {
             metrics,
             decisions: vec![[0u8; 64]; STREAMING_TRACEBACK],
+            margins: vec![0u32; STREAMING_TRACEBACK],
             write_pos: 0,
             accumulated: 0,
             pending_symbol: None,
             pending_soft: None,
+            last_reliabilities: Vec::new(),
         }
+    }
+
+    /// Reliability (path-metric margin) for each bit returned by the most
+    /// recent [`push_soft_symbols`](Self::push_soft_symbols) call, aligned
+    /// 1:1 with that output. Larger means a more confident trellis decision;
+    /// downstream stages can mark the lowest-confidence symbols as erasures.
+    pub fn last_reliabilities(&self) -> &[u32] {
+        &self.last_reliabilities
     }
 
     /// Push hard-decision channel symbols (one bit per byte, 0 or 1) and
@@ -135,7 +168,9 @@ impl StreamingViterbi {
         for &sym in symbols {
             if let Some(first) = self.pending_symbol.take() {
                 let received = [first & 1, sym & 1];
-                output.extend(self.step(received));
+                if let Some((bit, _)) = self.step(received) {
+                    output.push(bit);
+                }
             } else {
                 self.pending_symbol = Some(sym);
             }
@@ -155,9 +190,15 @@ impl StreamingViterbi {
     /// depth, identically to the hard path.
     pub fn push_soft_symbols(&mut self, soft: &[i8]) -> Vec<u8> {
         let mut output = Vec::new();
+        self.last_reliabilities.clear();
         for &sample in soft {
             if let Some(first) = self.pending_soft.take() {
-                output.extend(self.step_soft([i32::from(first), i32::from(sample)]));
+                if let Some((bit, reliability)) =
+                    self.step_soft([i32::from(first), i32::from(sample)])
+                {
+                    output.push(bit);
+                    self.last_reliabilities.push(reliability);
+                }
             } else {
                 self.pending_soft = Some(sample);
             }
@@ -166,13 +207,13 @@ impl StreamingViterbi {
     }
 
     /// Process one hard symbol pair (Hamming branch metric).
-    fn step(&mut self, received: [u8; 2]) -> Option<u8> {
+    fn step(&mut self, received: [u8; 2]) -> Option<(u8, u32)> {
         self.advance(|encoded| u32::from(viterbi::hamming2_pub(received, encoded)))
     }
 
     /// Process one soft symbol pair (squared-Euclidean branch metric to the
     /// expected (+/-SOFT_CENTER, +/-SOFT_CENTER) constellation point).
-    fn step_soft(&mut self, received: [i32; 2]) -> Option<u8> {
+    fn step_soft(&mut self, received: [i32; 2]) -> Option<(u8, u32)> {
         const SOFT_CENTER: i32 = 64;
         self.advance(|encoded| {
             let expected_a = if encoded[0] == 0 {
@@ -195,7 +236,7 @@ impl StreamingViterbi {
     /// emit one delayed output bit once the traceback buffer has filled.
     /// Shared by the hard ([`step`](Self::step)) and soft
     /// ([`step_soft`](Self::step_soft)) paths.
-    fn advance(&mut self, branch_metric: impl Fn([u8; 2]) -> u32) -> Option<u8> {
+    fn advance(&mut self, branch_metric: impl Fn([u8; 2]) -> u32) -> Option<(u8, u32)> {
         let mut next_metrics = [viterbi::INF; 64];
         let decisions = &mut self.decisions[self.write_pos];
 
@@ -214,9 +255,16 @@ impl StreamingViterbi {
             }
         }
 
+        // Reliability margin: how much better the best survivor is than the
+        // runner-up. A small margin means the trellis was nearly tied, i.e.
+        // the decoded bit is uncertain. Computed before normalization (a
+        // difference is invariant to the per-step subtraction below).
+        let (min_metric, second_metric) = two_smallest(&next_metrics);
+        let margin = second_metric.saturating_sub(min_metric);
+        self.margins[self.write_pos] = margin;
+
         // Normalize metrics to prevent overflow.
-        let min_metric = next_metrics.iter().copied().min().unwrap_or(0);
-        if min_metric > 0 {
+        if min_metric > 0 && min_metric != viterbi::INF {
             for m in next_metrics.iter_mut() {
                 if *m != viterbi::INF {
                     *m -= min_metric;
@@ -235,8 +283,10 @@ impl StreamingViterbi {
         }
     }
 
-    /// Trace back from the best current state to produce one output bit.
-    fn traceback(&self) -> u8 {
+    /// Trace back from the best current state to produce one output bit and
+    /// its reliability margin (taken from the oldest step in the window, the
+    /// step the emitted bit belongs to).
+    fn traceback(&self) -> (u8, u32) {
         let mut state = self
             .metrics
             .iter()
@@ -246,6 +296,7 @@ impl StreamingViterbi {
             .unwrap_or(0);
 
         let mut bit = 0u8;
+        let mut margin = 0u32;
         let mut pos = if self.write_pos == 0 {
             STREAMING_TRACEBACK - 1
         } else {
@@ -256,6 +307,7 @@ impl StreamingViterbi {
             let decision = self.decisions[pos][state];
             if i == STREAMING_TRACEBACK - 1 {
                 bit = (decision >> 6) & 1;
+                margin = self.margins[pos];
             }
             state = usize::from(decision & 0x3f);
             pos = if pos == 0 {
@@ -264,7 +316,7 @@ impl StreamingViterbi {
                 pos - 1
             };
         }
-        bit
+        (bit, margin)
     }
 }
 
@@ -404,6 +456,45 @@ mod streaming_viterbi_tests {
         assert!(
             hard_err > 50,
             "hard streaming should fail badly at this corruption ({hard_err})"
+        );
+    }
+
+    #[test]
+    fn soft_reliability_drops_on_unreliable_symbols() {
+        // The streaming decoder exposes a per-bit reliability margin. Feeding
+        // a stream with many low-confidence (near-zero) symbols should lower
+        // the average reliability relative to a clean strong stream, so a
+        // downstream RS stage can pick the weakest bytes as erasures.
+        let bits: Vec<u8> = (0..400u16).map(|i| u8::from(i % 3 == 0)).collect();
+        let hard = viterbi::encode_bits(&bits);
+
+        let clean: Vec<i8> = hard
+            .iter()
+            .map(|b| if b & 1 == 0 { 64 } else { -64 })
+            .collect();
+        let mut corrupt = clean.clone();
+        for idx in (3..hard.len()).step_by(5) {
+            corrupt[idx] = if corrupt[idx] > 0 { -4 } else { 4 };
+        }
+
+        let mut clean_dec = StreamingViterbi::new();
+        let clean_bits = clean_dec.push_soft_symbols(&clean);
+        let clean_rel = clean_dec.last_reliabilities().to_vec();
+
+        let mut corrupt_dec = StreamingViterbi::new();
+        let _ = corrupt_dec.push_soft_symbols(&corrupt);
+        let corrupt_rel = corrupt_dec.last_reliabilities().to_vec();
+
+        // Reliabilities are aligned 1:1 with the decoded bits.
+        assert_eq!(clean_bits.len(), clean_rel.len());
+        assert_eq!(clean_rel.len(), corrupt_rel.len());
+
+        let mean = |v: &[u32]| v.iter().map(|&x| u64::from(x)).sum::<u64>() / v.len() as u64;
+        assert!(
+            mean(&corrupt_rel) < mean(&clean_rel),
+            "corrupt mean reliability {} should drop below clean {}",
+            mean(&corrupt_rel),
+            mean(&clean_rel)
         );
     }
 }

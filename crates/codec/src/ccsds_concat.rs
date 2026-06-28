@@ -201,6 +201,79 @@ impl CcsdsConcatDecoder {
             corrected_errors: decoded.corrected_errors,
         })
     }
+
+    /// Decode a Viterbi-decoded RS codeword with soft-decision erasure
+    /// marking. `soft_bits` holds one signed confidence per codeword bit
+    /// (length `data.len() * 8`, bit order MSB-first within each byte) as
+    /// produced by the streaming soft Viterbi reliabilities; only the
+    /// magnitude is used.
+    ///
+    /// Errors-only RS(255,223) is tried first. If it fails (more than 16
+    /// symbol errors), the `erasure_k` least-reliable bytes -- ranked by the
+    /// minimum `|soft|` across their 8 bits -- are marked as erasures and the
+    /// codeword is re-decoded. Erasures double the effective correction
+    /// reach: RS can resolve a codeword when `2*errors + erasures <= 32`, so
+    /// providing good erasure positions recovers frames that errors-only
+    /// decoding rejects. Falls back to [`decode_frame_bytes`](Self::decode_frame_bytes)
+    /// when erasure marking does not apply (differential path or a soft
+    /// buffer that does not line up with the codeword).
+    pub fn decode_frame_bytes_with_soft(
+        &self,
+        data: &[u8],
+        soft_bits: &[f32],
+        erasure_k: usize,
+    ) -> Result<CcsdsConcatFrame, DecodeError> {
+        if data.len() < reed_solomon::PARITY_LEN + self.frame_size {
+            return Err(DecodeError::TooShort(data.len()));
+        }
+        if self.differential || soft_bits.len() != data.len() * 8 {
+            return self.decode_frame_bytes(data);
+        }
+
+        // CCSDS descramble (XOR, so per-byte reliability alignment is kept).
+        let mut bytes = data.to_vec();
+        ccsds_randomizer::xor_sequence(&mut bytes);
+
+        let rs = ReedSolomon::new(1);
+
+        // Errors-only first: cheaper, and spends no erasure budget.
+        if let Ok(decoded) = rs.decode_shortened(&bytes) {
+            if decoded.message.len() >= self.frame_size {
+                return Ok(CcsdsConcatFrame {
+                    payload: decoded.message[..self.frame_size].to_vec(),
+                    corrected_errors: decoded.corrected_errors,
+                });
+            }
+        }
+
+        // Rank bytes by ascending reliability (minimum |soft| over their bits)
+        // and mark the weakest as erasures.
+        let mut byte_confidences: Vec<(usize, f32)> = (0..data.len())
+            .map(|i| {
+                let mut min_abs = f32::INFINITY;
+                for j in 0..8 {
+                    let s = soft_bits[i * 8 + j].abs();
+                    if s < min_abs {
+                        min_abs = s;
+                    }
+                }
+                (i, min_abs)
+            })
+            .collect();
+        byte_confidences.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let k = erasure_k.min(data.len()).min(reed_solomon::PARITY_LEN);
+        let erasures: Vec<usize> = byte_confidences[..k].iter().map(|(idx, _)| *idx).collect();
+
+        let decoded = rs.decode_shortened_with_erasures(&bytes, &erasures)?;
+        if decoded.message.len() < self.frame_size {
+            return Err(DecodeError::TooShort(decoded.message.len()));
+        }
+        Ok(CcsdsConcatFrame {
+            payload: decoded.message[..self.frame_size].to_vec(),
+            corrected_errors: decoded.corrected_errors,
+        })
+    }
 }
 
 /// Differential decode: output[i] = input[i] XOR input[i-1].
@@ -414,5 +487,44 @@ mod tests {
             .expect("decode real ASRTU-1 frame");
         assert_eq!(frame.payload, ASRTU1_REAL_PAYLOAD);
         assert_eq!(frame.corrected_errors, 0);
+    }
+
+    #[test]
+    fn soft_erasure_recovers_beyond_errors_only() {
+        // Build the scrambled RS codeword as it reaches the codec (after the
+        // streaming Viterbi and NRZ-S stages): RS encode -> CCSDS scramble.
+        let rs_codeword = reed_solomon::encode_shortened(&ASRTU1_REAL_PAYLOAD, 1);
+        assert_eq!(rs_codeword.len(), 255);
+        let mut scrambled = rs_codeword;
+        ccsds_randomizer::xor_sequence(&mut scrambled);
+
+        // Corrupt 24 bytes -- past the errors-only reach of 16, but inside the
+        // 32-symbol erasure capacity once their positions are known.
+        let error_positions: Vec<usize> = (0..24).map(|i| 3 + i * 9).collect();
+        let mut data = scrambled;
+        let mut soft = vec![32.0f32; data.len() * 8];
+        for &p in &error_positions {
+            data[p] ^= 0x5a;
+            // Mark every bit of a corrupted byte as low confidence so the
+            // codec ranks it among the erasure candidates.
+            for j in 0..8 {
+                soft[p * 8 + j] = 1.0;
+            }
+        }
+
+        let decoder = CcsdsConcatDecoder::new(223, false, RsBasis::Conventional);
+
+        // Errors-only decoding cannot cope with 24 symbol errors.
+        assert!(
+            decoder.decode_frame_bytes(&data).is_err(),
+            "errors-only RS should reject 24 byte errors"
+        );
+
+        // Soft erasure marking recovers the genuine payload.
+        let frame = decoder
+            .decode_frame_bytes_with_soft(&data, &soft, 24)
+            .expect("soft erasure decode should recover the frame");
+        assert_eq!(frame.payload, ASRTU1_REAL_PAYLOAD);
+        assert_eq!(frame.corrected_errors, 24);
     }
 }
