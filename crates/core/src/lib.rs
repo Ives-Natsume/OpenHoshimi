@@ -67,6 +67,17 @@ pub trait Demodulator: Send {
     fn last_soft(&self) -> &[f32] {
         &[]
     }
+
+    /// Optional signed soft-decision symbols (`i8`) for each bit emitted by
+    /// the most recent [`push_samples`](Self::push_samples) call, aligned
+    /// 1:1 with that bit vector. Unlike [`last_soft`](Self::last_soft), the
+    /// sign here matches the emitted hard bit (bit `0` -> positive, bit `1`
+    /// -> negative) and the magnitude carries per-symbol reliability, which
+    /// is the convention consumed by the streaming soft Viterbi decoder. The
+    /// default returns an empty slice for demodulators without soft output.
+    fn last_soft_symbols(&self) -> &[i8] {
+        &[]
+    }
 }
 
 /// Decodes a line-coded bit stream in place.

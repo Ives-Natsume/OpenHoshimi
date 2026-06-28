@@ -1015,8 +1015,20 @@ where
         // For CCSDS concatenated, run the streaming Viterbi decoder on the
         // channel symbols before the framer. The ASM is convolutionally
         // encoded, so the framer must detect it in the Viterbi output.
+        //
+        // Prefer soft-decision Viterbi (~2 dB of coding gain on weak passes)
+        // when the demodulator exposes per-symbol soft values aligned 1:1 with
+        // the hard bits and no hard-only per-bit transform sits in between.
         if let Some(viterbi) = self.inner_viterbi.as_mut() {
-            bits = viterbi.push_symbols(&bits);
+            let soft = demodulator.last_soft_symbols();
+            bits = if self.line_decoder.is_none()
+                && self.descrambler.is_none()
+                && soft.len() == bits.len()
+            {
+                viterbi.push_soft_symbols(soft)
+            } else {
+                viterbi.push_symbols(&bits)
+            };
         }
 
         // NRZ-S (differential) decode the Viterbi output before the framer,
@@ -1792,7 +1804,9 @@ impl SoftAo40Pipeline {
                         Ok(payload) => format!("hard OK ({} corrected)", payload.corrected_errors),
                         Err(hard_err) => format!("hard ERR {hard_err}"),
                     };
-                    eprintln!("closedhoshimi: soft Ao40 frame decode failed: {err}; {hard_summary}");
+                    eprintln!(
+                        "closedhoshimi: soft Ao40 frame decode failed: {err}; {hard_summary}"
+                    );
                     if let Ok(payload) = hard_result {
                         decoded.push(DecodedFrame::Ao40 {
                             payload: payload.payload,

@@ -99,8 +99,10 @@ pub struct StreamingViterbi {
     write_pos: usize,
     /// Number of steps accumulated (saturates at traceback depth).
     accumulated: usize,
-    /// Pending output bit from an odd-symbol input.
+    /// Pending hard symbol from an odd-length `push_symbols` input.
     pending_symbol: Option<u8>,
+    /// Pending soft symbol from an odd-length `push_soft_symbols` input.
+    pending_soft: Option<i8>,
 }
 
 const STREAMING_TRACEBACK: usize = 35;
@@ -122,6 +124,7 @@ impl StreamingViterbi {
             write_pos: 0,
             accumulated: 0,
             pending_symbol: None,
+            pending_soft: None,
         }
     }
 
@@ -140,8 +143,59 @@ impl StreamingViterbi {
         output
     }
 
-    /// Process one symbol pair and return 0 or 1 decoded bits.
+    /// Push soft-decision channel symbols and return decoded bits.
+    ///
+    /// Each soft sample is an `i8` correlation value: a transmitted `0` maps
+    /// to a positive value and a transmitted `1` to a negative value, with
+    /// magnitude carrying confidence (full scale up to +/-127, soft center
+    /// 64). Soft decoding recovers roughly 2 dB of coding gain over the
+    /// hard-decision [`push_symbols`](Self::push_symbols) path on noisy
+    /// passes, because low-magnitude (unreliable) symbols are deweighted
+    /// instead of being hard-sliced. Output is delayed by the traceback
+    /// depth, identically to the hard path.
+    pub fn push_soft_symbols(&mut self, soft: &[i8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for &sample in soft {
+            if let Some(first) = self.pending_soft.take() {
+                output.extend(self.step_soft([i32::from(first), i32::from(sample)]));
+            } else {
+                self.pending_soft = Some(sample);
+            }
+        }
+        output
+    }
+
+    /// Process one hard symbol pair (Hamming branch metric).
     fn step(&mut self, received: [u8; 2]) -> Option<u8> {
+        self.advance(|encoded| u32::from(viterbi::hamming2_pub(received, encoded)))
+    }
+
+    /// Process one soft symbol pair (squared-Euclidean branch metric to the
+    /// expected (+/-SOFT_CENTER, +/-SOFT_CENTER) constellation point).
+    fn step_soft(&mut self, received: [i32; 2]) -> Option<u8> {
+        const SOFT_CENTER: i32 = 64;
+        self.advance(|encoded| {
+            let expected_a = if encoded[0] == 0 {
+                SOFT_CENTER
+            } else {
+                -SOFT_CENTER
+            };
+            let expected_b = if encoded[1] == 0 {
+                SOFT_CENTER
+            } else {
+                -SOFT_CENTER
+            };
+            let diff_a = received[0] - expected_a;
+            let diff_b = received[1] - expected_b;
+            (diff_a * diff_a + diff_b * diff_b) as u32
+        })
+    }
+
+    /// Advance the trellis one step using `branch_metric(expected_pair)` and
+    /// emit one delayed output bit once the traceback buffer has filled.
+    /// Shared by the hard ([`step`](Self::step)) and soft
+    /// ([`step_soft`](Self::step_soft)) paths.
+    fn advance(&mut self, branch_metric: impl Fn([u8; 2]) -> u32) -> Option<u8> {
         let mut next_metrics = [viterbi::INF; 64];
         let decisions = &mut self.decisions[self.write_pos];
 
@@ -152,8 +206,7 @@ impl StreamingViterbi {
             for bit in 0..=1u8 {
                 let next_state = ((state << 1) | usize::from(bit)) & 63;
                 let encoded = viterbi::encode_branch(state as u8, bit);
-                let branch_metric = u32::from(viterbi::hamming2_pub(received, encoded));
-                let candidate = metric + branch_metric;
+                let candidate = metric.saturating_add(branch_metric(encoded));
                 if candidate < next_metrics[next_state] {
                     next_metrics[next_state] = candidate;
                     decisions[next_state] = (state as u8) | (bit << 6);
@@ -222,9 +275,11 @@ mod streaming_viterbi_tests {
     #[test]
     fn streaming_matches_block_decoder() {
         // Encode a known bit sequence, then verify the streaming decoder
-        // produces the same output as the block decoder (after the
-        // traceback delay settles).
-        let bits: Vec<u8> = (0..200u8).map(|i| u8::from(i % 5 == 0)).collect();
+        // produces the same output as the block decoder. Use a non-periodic
+        // pattern so the comparison cannot pass by accidental alignment.
+        let bits: Vec<u8> = (0..200u16)
+            .map(|i| u8::from((i % 3 == 0) ^ (i % 7 == 0)))
+            .collect();
         let symbols = viterbi::encode_bits(&bits);
 
         let block_decoded = viterbi::decode_bits(&symbols).expect("block decode");
@@ -232,23 +287,20 @@ mod streaming_viterbi_tests {
         let mut streaming = StreamingViterbi::new();
         let stream_decoded = streaming.push_symbols(&symbols);
 
-        // The streaming decoder has a traceback delay, so the first
-        // STREAMING_TRACEBACK bits are delayed. Compare the overlapping
-        // region.
-        let skip = STREAMING_TRACEBACK;
+        // The streaming decoder emits the oldest surviving bit each step, so
+        // output bit i corresponds directly to source bit i; only the final
+        // (STREAMING_TRACEBACK - 1) bits stay unflushed in the tail.
         assert!(
-            stream_decoded.len() + skip >= bits.len(),
+            stream_decoded.len() + STREAMING_TRACEBACK >= bits.len(),
             "streaming output too short: {} + {} < {}",
             stream_decoded.len(),
-            skip,
+            STREAMING_TRACEBACK,
             bits.len()
         );
-
-        // The streaming output (after delay) should match the block output.
-        let compare_len = stream_decoded.len().min(block_decoded.len() - skip);
+        let compare_len = stream_decoded.len().min(block_decoded.len());
         assert_eq!(
             &stream_decoded[..compare_len],
-            &block_decoded[skip..skip + compare_len],
+            &block_decoded[..compare_len],
             "streaming and block decoders disagree"
         );
     }
@@ -303,6 +355,55 @@ mod streaming_viterbi_tests {
         assert!(
             found >= 2,
             "expected at least 2 ASM detections, got {found}"
+        );
+    }
+
+    #[test]
+    fn soft_streaming_beats_hard_streaming() {
+        // Encode a known message, then inject a dense pattern of channel bit
+        // flips. The soft stream flips the same positions but with reduced
+        // magnitude, marking them as unreliable. Soft decoding deweights
+        // those symbols and recovers the message bit-exact, while the hard
+        // decoder (which cannot tell a confident bit from a coin-flip) makes
+        // errors. This is the ~2 dB coding gain that matters on weak passes.
+        let bits: Vec<u8> = (0..400u16).map(|i| u8::from(i % 3 == 0)).collect();
+        let hard = viterbi::encode_bits(&bits);
+
+        let mut hard_corrupt = hard.clone();
+        let mut soft_corrupt: Vec<i8> = hard
+            .iter()
+            .map(|b| if b & 1 == 0 { 64 } else { -64 })
+            .collect();
+        for idx in (3..hard.len()).step_by(5) {
+            // Hard path sees a full bit flip (no confidence information).
+            hard_corrupt[idx] ^= 1;
+            // Soft path sees a wrong-sign but near-zero-confidence sample,
+            // as a fading/noisy symbol would appear. Soft decoding can lean
+            // on the surrounding strong symbols; hard slicing cannot.
+            soft_corrupt[idx] = if soft_corrupt[idx] > 0 { -4 } else { 4 };
+        }
+
+        let mut hard_dec = StreamingViterbi::new();
+        let hard_out = hard_dec.push_symbols(&hard_corrupt);
+        let mut soft_dec = StreamingViterbi::new();
+        let soft_out = soft_dec.push_soft_symbols(&soft_corrupt);
+
+        // The streaming decoder emits the oldest surviving bit each step, so
+        // output bit i corresponds directly to source bit i (the final
+        // traceback-depth bits stay unflushed in the tail).
+        let cmp = soft_out.len().min(hard_out.len()).min(bits.len());
+        assert!(cmp > 0, "decoders produced no comparable output");
+        let count_err = |out: &[u8]| (0..cmp).filter(|&i| out[i] != bits[i]).count();
+        let hard_err = count_err(&hard_out);
+        let soft_err = count_err(&soft_out);
+
+        assert_eq!(
+            soft_err, 0,
+            "soft streaming should recover the message bit-exact"
+        );
+        assert!(
+            hard_err > 50,
+            "hard streaming should fail badly at this corruption ({hard_err})"
         );
     }
 }

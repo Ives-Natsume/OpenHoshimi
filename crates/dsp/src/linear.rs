@@ -148,6 +148,11 @@ pub struct LinearDemodulator {
     matched_buffer_i: Vec<f32>,
     matched_buffer_q: Vec<f32>,
     matched_index: usize,
+    /// Soft-decision (i8) value for each bit emitted by the most recent
+    /// `push_samples` call, sign-aligned with the emitted hard bit (bit `0`
+    /// -> positive, bit `1` -> negative, magnitude = reliability). Populated
+    /// for binary (BPSK/DBPSK) modes so the streaming Viterbi can run soft.
+    last_soft_i8: Vec<i8>,
 }
 
 impl LinearDemodulator {
@@ -218,6 +223,7 @@ impl LinearDemodulator {
             matched_buffer_i: vec![0.0; buffer_len],
             matched_buffer_q: vec![0.0; buffer_len],
             matched_index: 0,
+            last_soft_i8: Vec::new(),
         })
     }
 
@@ -238,6 +244,49 @@ impl LinearDemodulator {
             LinearMode::Bpsk | LinearMode::Dbpsk => vec![self.slice_binary_soft(current)],
             LinearMode::Qpsk | LinearMode::Oqpsk => self.slice_quadrature_soft(current),
         }
+    }
+
+    /// Slice one binary symbol into its hard bit AND a sign-aligned soft
+    /// value in a single pass, so any differential state advances exactly
+    /// once. The hard bit is identical to [`slice_binary`](Self::slice_binary);
+    /// the soft sign matches it under the streaming-Viterbi convention
+    /// (bit `0` -> positive, bit `1` -> negative) with magnitude carrying
+    /// per-symbol reliability.
+    fn slice_binary_paired(&mut self, current: IqSample) -> (u8, i8) {
+        let (mut bit, mut conf) = if self.config.differential {
+            let (bit, cos) = match self.previous_binary_symbol {
+                Some(previous) => {
+                    let dot = previous.i.mul_add(current.i, previous.q * current.q);
+                    let mag_prev = previous
+                        .i
+                        .mul_add(previous.i, previous.q * previous.q)
+                        .sqrt();
+                    let mag_curr = current.i.mul_add(current.i, current.q * current.q).sqrt();
+                    let denom = mag_prev * mag_curr;
+                    let cos = if denom > f32::EPSILON {
+                        (dot / denom).clamp(-1.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    // bit = (dot < 0); cos has the same sign as dot, so cos is
+                    // already in the Viterbi convention (bit 0 -> positive).
+                    (u8::from(dot < 0.0), cos)
+                }
+                None => (0u8, 0.0f32),
+            };
+            self.previous_binary_symbol = Some(current);
+            (bit, cos)
+        } else {
+            // Hard bit matches `slice_binary`: i >= 0 -> 1. Encoding bit 0 as
+            // positive then requires the negated in-phase projection.
+            (u8::from(current.i >= 0.0), -normalize_in_phase(current))
+        };
+
+        if self.config.invert {
+            bit ^= 1;
+            conf = -conf;
+        }
+        (bit, soft_to_i8(conf))
     }
 
     fn normalize_sample(&self, sample: IqSample) -> IqSample {
@@ -543,6 +592,7 @@ impl Demodulator for LinearDemodulator {
 
     fn push_samples(&mut self, samples: &[IqSample]) -> Vec<u8> {
         let mut bits = Vec::new();
+        self.last_soft_i8.clear();
 
         for &sample in samples {
             let sample = self.normalize_sample(sample);
@@ -566,7 +616,15 @@ impl Demodulator for LinearDemodulator {
                 };
                 self.update_carrier_tracker(current);
                 write_symbol_dump(current);
-                bits.extend_from_slice(&self.slice_symbol(current));
+                if matches!(self.config.mode, LinearMode::Bpsk | LinearMode::Dbpsk) {
+                    // Binary modes also produce a sign-aligned soft value so a
+                    // downstream streaming Viterbi can decode soft (~2 dB gain).
+                    let (bit, soft) = self.slice_binary_paired(current);
+                    bits.push(bit);
+                    self.last_soft_i8.push(soft);
+                } else {
+                    bits.extend_from_slice(&self.slice_symbol(current));
+                }
                 self.update_timing_recovery();
                 self.i_sum = 0.0;
                 self.q_sum = 0.0;
@@ -575,6 +633,10 @@ impl Demodulator for LinearDemodulator {
         }
 
         bits
+    }
+
+    fn last_soft_symbols(&self) -> &[i8] {
+        &self.last_soft_i8
     }
 
     fn sample_rate(&self) -> u32 {
