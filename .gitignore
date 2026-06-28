@@ -15,3 +15,6 @@ frame*.bin
 
 # Reference documents (keep locally, not in repo).
 *.pdf
+
+# Confidential design docs: keep locally, never track or publish.
+docs/
