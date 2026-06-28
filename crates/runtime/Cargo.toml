@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Shared runtime state for OpenHoshimi decode pipelines"
+description = "Shared runtime state for ClosedHoshimi decode pipelines"
 
 [dependencies]
 openhoshimi-core = { workspace = true }

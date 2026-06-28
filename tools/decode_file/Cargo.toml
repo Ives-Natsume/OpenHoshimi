@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Offline WAV-to-frames decoding tool for OpenHoshimi"
+description = "Offline WAV-to-frames decoding tool for ClosedHoshimi"
 
 [[bin]]
 name = "decode_file"

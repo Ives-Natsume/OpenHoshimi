@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "IQ WAV spectral and constellation inspector for OpenHoshimi"
+description = "IQ WAV spectral and constellation inspector for ClosedHoshimi"
 
 [[bin]]
 name = "iq_inspect"

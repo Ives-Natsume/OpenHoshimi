@@ -20,7 +20,7 @@ version = "1.6.0"
 edition = "2021"
 rust-version = "1.75"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/IzumiChino/openhoshimi"
+repository = "https://github.com/IzumiChino/ClosedHoshimi"
 authors = ["Izumi Chino"]
 
 [workspace.dependencies]

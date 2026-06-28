@@ -128,7 +128,7 @@ fn synthesize_afsk(symbols: &[u8]) -> Vec<f32> {
 
 #[test]
 fn afsk_1k2_aprs_roundtrip_through_pipeline() {
-    let info = b"=4920.00N/00133.00W>OpenHoshimi self-test";
+    let info = b"=4920.00N/00133.00W>ClosedHoshimi self-test";
     let frame_bytes = ax25_ui_frame("APRS", "OPNHSH", info);
     let hdlc_bits = hdlc_encode(&frame_bytes);
     // Insert a long preamble of HDLC flags so the AFSK detector locks

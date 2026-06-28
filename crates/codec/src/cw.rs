@@ -1,6 +1,6 @@
 //! CW (Morse code) audio decoder.
 //!
-//! CW does not fit the OpenHoshimi BitPipeline very cleanly — there is
+//! CW does not fit the ClosedHoshimi BitPipeline very cleanly — there is
 //! no fixed baudrate, no syncword, no frame size — so this module
 //! exposes a self-contained [`CwAnalyzer`] that consumes audio samples
 //! and emits decoded ASCII text. It is suitable for narrowband CW

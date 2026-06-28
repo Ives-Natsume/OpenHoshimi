@@ -1,4 +1,4 @@
-//! TOML-driven telemetry field parser for OpenHoshimi.
+//! TOML-driven telemetry field parser for ClosedHoshimi.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]

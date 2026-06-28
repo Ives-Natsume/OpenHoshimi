@@ -1,4 +1,4 @@
-//! Offline file decoding tool for OpenHoshimi.
+//! Offline file decoding tool for ClosedHoshimi.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

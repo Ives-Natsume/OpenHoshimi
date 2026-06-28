@@ -1,4 +1,4 @@
-//! `sat_tool import-grsat` — convert gr-satellites YAML to OpenHoshimi TOML.
+//! `sat_tool import-grsat` — convert gr-satellites YAML to ClosedHoshimi TOML.
 
 use std::collections::BTreeMap;
 use std::path::Path;

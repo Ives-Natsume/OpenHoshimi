@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Diagnostic dumper for OpenHoshimi CPM demodulator output."
+description = "Diagnostic dumper for ClosedHoshimi CPM demodulator output."
 
 [[bin]]
 name = "cpm_dump"

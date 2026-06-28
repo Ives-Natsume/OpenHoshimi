@@ -1,4 +1,4 @@
-//! Demodulators and bit-level processing for OpenHoshimi.
+//! Demodulators and bit-level processing for ClosedHoshimi.
 //!
 //! See [`afsk::AfskDemodulator`] for Bell 202 audio FSK,
 //! [`ao40::Ao40Framer`] for AO-40 FEC distributed sync framing,

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Satellite TOML generator, validator, and importer for OpenHoshimi"
+description = "Satellite TOML generator, validator, and importer for ClosedHoshimi"
 
 [[bin]]
 name = "sat_tool"

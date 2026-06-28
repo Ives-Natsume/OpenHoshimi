@@ -1,4 +1,4 @@
-//! Shared runtime plumbing for OpenHoshimi decode pipelines.
+//! Shared runtime plumbing for ClosedHoshimi decode pipelines.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]

@@ -1,4 +1,4 @@
-//! egui desktop application for OpenHoshimi.
+//! egui desktop application for ClosedHoshimi.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![deny(missing_docs)]
@@ -79,9 +79,9 @@ fn alignment_scorer_prefix_secs(baudrate: u32) -> f32 {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
-        "OpenHoshimi",
+        "ClosedHoshimi",
         options,
-        Box::new(|cc| Ok(Box::new(OpenHoshimiApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(ClosedHoshimiApp::new(cc)))),
     )
 }
 
@@ -98,7 +98,7 @@ enum BottomTab {
 }
 
 /// Main GUI state.
-struct OpenHoshimiApp {
+struct ClosedHoshimiApp {
     satellites_dir: PathBuf,
     satellites: Vec<SatelliteDefinition>,
     selected_satellite: usize,
@@ -322,7 +322,7 @@ enum DecodePace {
     Fast,
 }
 
-impl OpenHoshimiApp {
+impl ClosedHoshimiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_fonts(&cc.egui_ctx);
         configure_style(&cc.egui_ctx);
@@ -729,7 +729,7 @@ impl OpenHoshimiApp {
         };
 
         let mut text = String::new();
-        text.push_str("# OpenHoshimi frame export\n");
+        text.push_str("# ClosedHoshimi frame export\n");
         if let Some(sat) = self.selected_satellite() {
             text.push_str(&format!("# satellite: {}\n", sat.satellite.name));
             text.push_str(&format!("# norad_id: {}\n", sat.satellite.norad_id));
@@ -805,13 +805,13 @@ impl OpenHoshimiApp {
     }
 }
 
-impl Drop for OpenHoshimiApp {
+impl Drop for ClosedHoshimiApp {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-impl eframe::App for OpenHoshimiApp {
+impl eframe::App for ClosedHoshimiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(path) = self.startup_wav.take() {
             self.open_wav_path(path);
@@ -858,7 +858,7 @@ impl eframe::App for OpenHoshimiApp {
     }
 }
 
-impl OpenHoshimiApp {
+impl ClosedHoshimiApp {
     fn alignment_modal(&self, ctx: &egui::Context) {
         let (current, total) = match self.alignment_state {
             AlignmentState::Aligning { current, total } => (current, total),
@@ -987,7 +987,7 @@ impl OpenHoshimiApp {
             });
             ui.menu_button("Help", |ui| {
                 ui.label(
-                    RichText::new(concat!("OpenHoshimi ", env!("CARGO_PKG_VERSION")))
+                    RichText::new(concat!("ClosedHoshimi ", env!("CARGO_PKG_VERSION")))
                         .color(Palette::TEXT)
                         .monospace(),
                 );
@@ -1219,7 +1219,7 @@ impl OpenHoshimiApp {
             status_segment(ui, &self.source_description, Palette::MUTED);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
-                    RichText::new(concat!("OpenHoshimi ", env!("CARGO_PKG_VERSION")))
+                    RichText::new(concat!("ClosedHoshimi ", env!("CARGO_PKG_VERSION")))
                         .color(Palette::MUTED)
                         .monospace()
                         .size(11.0),

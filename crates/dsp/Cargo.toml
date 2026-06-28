@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Demodulators and bit-level processing for OpenHoshimi"
+description = "Demodulators and bit-level processing for ClosedHoshimi"
 
 [dependencies]
 openhoshimi-core = { workspace = true }

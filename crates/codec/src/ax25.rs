@@ -20,7 +20,7 @@ impl Ax25Decoder {
         Self
     }
 
-    /// Decode an OpenHoshimi [`Frame`] as an AX.25 frame.
+    /// Decode an ClosedHoshimi [`Frame`] as an AX.25 frame.
     ///
     /// The input frame must already have had HDLC flags, bit stuffing, and
     /// FCS removed by the framing stage.

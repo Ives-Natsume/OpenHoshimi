@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn round_trip_text() {
-        let text = "Hello, OpenHoshimi! 73 de OH";
+        let text = "Hello, ClosedHoshimi! 73 de OH";
         let mut bits = vec![0u8; 16]; // leading idle
         bits.extend(varicode_encode_bits(text));
         bits.extend(vec![0u8; 16]); // trailing idle

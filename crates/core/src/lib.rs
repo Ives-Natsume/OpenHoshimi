@@ -1,4 +1,4 @@
-//! Core traits, data models, and error types for OpenHoshimi.
+//! Core traits, data models, and error types for ClosedHoshimi.
 //!
 //! This crate is the foundation of the workspace: every other crate depends
 //! on it, while it itself depends on nothing from the rest of the workspace.

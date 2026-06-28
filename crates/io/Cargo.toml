@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Input sources (WAV, IQ files, soundcard) for OpenHoshimi"
+description = "Input sources (WAV, IQ files, soundcard) for ClosedHoshimi"
 
 [dependencies]
 openhoshimi-core = { workspace = true }

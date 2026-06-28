@@ -6,10 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "egui desktop application for OpenHoshimi"
+description = "egui desktop application for ClosedHoshimi"
 
 [[bin]]
-name = "openhoshimi"
+name = "closedhoshimi"
 path = "src/main.rs"
 
 [dependencies]

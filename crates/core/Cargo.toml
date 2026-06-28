@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Core traits, data models, and satellite definition loader for OpenHoshimi"
+description = "Core traits, data models, and satellite definition loader for ClosedHoshimi"
 
 [dependencies]
 serde = { workspace = true }

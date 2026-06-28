@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "TOML-driven telemetry field parser for OpenHoshimi"
+description = "TOML-driven telemetry field parser for ClosedHoshimi"
 
 [dependencies]
 openhoshimi-core = { workspace = true }

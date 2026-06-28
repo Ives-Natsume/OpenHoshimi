@@ -20,7 +20,7 @@
 //!
 //!   * Recovery of the 200 baud bit stream from FM-discriminator
 //!     audio. The output is one byte per bit (`0x00` / `0x01`) so it
-//!     plugs into the existing OpenHoshimi [`Demodulator`] surface.
+//!     plugs into the existing ClosedHoshimi [`Demodulator`] surface.
 //!
 //! Out of scope (deferred until real recordings exist):
 //!

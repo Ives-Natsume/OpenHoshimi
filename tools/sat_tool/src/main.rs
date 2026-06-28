@@ -1,4 +1,4 @@
-//! Satellite TOML generator, validator, and importer for OpenHoshimi.
+//! Satellite TOML generator, validator, and importer for ClosedHoshimi.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -12,7 +12,7 @@ mod mapping;
 mod wizard;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Satellite TOML toolkit for OpenHoshimi")]
+#[command(author, version, about = "Satellite TOML toolkit for ClosedHoshimi")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -25,7 +25,7 @@ enum Command {
         /// Path to the satellite TOML file.
         file: PathBuf,
     },
-    /// Import a gr-satellites YAML definition and output OpenHoshimi TOML.
+    /// Import a gr-satellites YAML definition and output ClosedHoshimi TOML.
     ImportGrsat {
         /// Path to the gr-satellites YAML file.
         file: PathBuf,

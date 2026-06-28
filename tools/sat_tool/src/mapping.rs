@@ -1,7 +1,7 @@
 //! Shared modulation/framing/codec mapping tables.
 //!
 //! Maps between external representations (gr-satellites YAML field values,
-//! SatNOGS DB mode strings) and OpenHoshimi TOML field values.
+//! SatNOGS DB mode strings) and ClosedHoshimi TOML field values.
 
 /// Standard decode chain for a given framing protocol.
 #[derive(Debug, Clone)]

@@ -1,4 +1,4 @@
-//! Diagnostic dumper for OpenHoshimi's CPM demodulator.
+//! Diagnostic dumper for ClosedHoshimi's CPM demodulator.
 //!
 //! Reads a stereo IQ WAV, optionally runs `CpmDemodulator` end-to-end, or
 //! a hand-rolled bypass path (`--bypass`) that does carrier mix + atan2

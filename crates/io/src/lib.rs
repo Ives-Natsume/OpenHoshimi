@@ -1,4 +1,4 @@
-//! Input sources for OpenHoshimi.
+//! Input sources for ClosedHoshimi.
 //!
 //! This crate provides offline WAV readers, OGG Vorbis readers, a live
 //! soundcard input source, and the mono-real-audio adapters used by the
