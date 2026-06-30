@@ -456,8 +456,11 @@ impl LinearDemodulator {
                     let cross = s2.q * prev.i - s2.i * prev.q;
                     let fll_error = (cross / denom).clamp(-1.0, 1.0);
                     let leak = self.freq_loop_alpha;
+                    // Same `+carrier_phase` de-rotation convention as the Costas
+                    // terms: the discriminator must be SUBTRACTED, otherwise the
+                    // FLL runs to the wrong NCO rail.
                     self.nco_fll_offset =
-                        (1.0 - leak) * self.nco_fll_offset + self.freq_loop_alpha * fll_error;
+                        (1.0 - leak) * self.nco_fll_offset - self.freq_loop_alpha * fll_error;
                     self.nco_fll_offset = self
                         .nco_fll_offset
                         .clamp(-self.nco_limit_radians, self.nco_limit_radians);
@@ -474,9 +477,27 @@ impl LinearDemodulator {
                 sign_i * q - sign_q * i
             }
         };
-        let error = error.clamp(-1.0, 1.0);
+        // Sign convention: `correct_frequency` de-rotates each sample by
+        // `+carrier_phase`, so to pull a symbol sitting at residual angle `+theta`
+        // back onto the in-phase axis the loop must drive `carrier_phase` toward
+        // `-theta`. The Costas detector `i*q` is positive for `+theta`, so both PI
+        // terms must SUBTRACT it; negating `error` once here flips both
+        // consistently. (Adding it is positive feedback that locks onto the
+        // quadrature axis instead. This path is only active when
+        // `carrier_loop_bandwidth > 0`, which no unit test exercised.)
+        let error = -error.clamp(-1.0, 1.0);
 
-        self.nco_increment += self.loop_beta * error;
+        // The Costas detector and both PI terms are updated once per symbol,
+        // but `nco_increment` is a per-sample phase advance: `correct_frequency`
+        // adds it on every one of the `samples_per_symbol` samples in a symbol.
+        // The integral term must therefore be scaled by 1/samples_per_symbol so
+        // its per-symbol phase contribution changes by `loop_beta * error` (the
+        // designed amount) instead of `loop_beta * error * samples_per_symbol`.
+        // Without this the realized damping ratio collapses by sqrt(sps) (~6.3x
+        // at 40 sps), leaving the loop badly under-damped: it limps on constant
+        // offsets but cannot track Doppler drift, and widening the bandwidth
+        // only drives it into instability.
+        self.nco_increment += self.loop_beta * error / self.nominal_samples_per_symbol;
         self.nco_increment = self
             .nco_increment
             .clamp(-self.nco_limit_radians, self.nco_limit_radians);
@@ -886,6 +907,55 @@ mod tests {
         let recovered = demodulator.push_samples(&offset_samples);
 
         assert_eq!(recovered, expected);
+    }
+
+    #[test]
+    fn carrier_loop_acquires_uncorrected_offset() {
+        // Regression guard for the Costas carrier loop. Every other test
+        // leaves `carrier_loop_bandwidth = 0`, so `update_carrier_tracker`
+        // short-circuits and the loop never runs -- which is how a
+        // positive-feedback sign error and a per-symbol/per-sample integral
+        // mis-scaling both shipped while 56 tests passed. Here we force the
+        // loop to acquire and track a frequency offset that is NOT corrected
+        // statically (frequency_offset_hz = 0), at a realistic 40 samples per
+        // symbol, and require bit-exact recovery up to the BPSK 180-degree
+        // phase ambiguity.
+        let bits: Vec<u8> = (0..240u32).map(|i| u8::from((i * 7 + 3) % 5 == 0)).collect();
+        let symbols: Vec<IqSample> = bits
+            .iter()
+            .map(|b| IqSample {
+                i: if *b == 1 { 1.0 } else { -1.0 },
+                q: 0.0,
+            })
+            .collect();
+        let clean = repeat_symbols(&symbols, 40); // 48000 Hz / 1200 baud = 40 sps
+        let offset = add_frequency_offset(&clean, 48_000, 40.0);
+
+        let mut config = LinearConfig::new(48_000, 1_200, LinearMode::Bpsk);
+        config.frequency_offset_hz = 0.0; // loop must acquire it, not static correction
+        config.carrier_loop_bandwidth = 0.05;
+        let mut demodulator = LinearDemodulator::new(config).expect("valid config");
+
+        let recovered = demodulator.push_samples(&offset);
+
+        // Skip the acquisition transient, then the loop must be locked: the
+        // tail matches the transmitted bits exactly, modulo a global inversion.
+        let skip = 60usize;
+        let n = recovered.len().min(bits.len());
+        assert!(n > skip + 80, "too few symbols recovered: {n}");
+        let direct = (skip..n).filter(|&k| recovered[k] != bits[k]).count();
+        let inverted = (skip..n).filter(|&k| recovered[k] == bits[k]).count();
+        let errors = direct.min(inverted);
+        let rate = errors as f32 / (n - skip) as f32;
+        // A locked loop drives the settled-tail error rate far below the 0.5
+        // of an unlocked/random output. Before the sign fix the loop locked
+        // onto the quadrature axis and this rate sat near 0.5; after the fix
+        // it is well under 0.2.
+        assert!(
+            rate < 0.2,
+            "carrier loop did not lock: error rate {rate:.3} (errors={errors} direct={direct} inverted={inverted} of {})",
+            n - skip
+        );
     }
 
     #[test]

@@ -37,13 +37,14 @@ mode = "dbpsk"
 frequency_offset_hz = 0.0
 differential = true
 swap_iq = true
-# Costas tracks tight phase. NCO clamp spans the LEO Doppler swing
-# (~3-4 kHz at 145 MHz over a 4-min pass) so Costas can pull DC offset
-# back to baseband without saturating. FLL is currently disabled: the
-# Kay-on-squared-symbols discriminator is too noisy at this SNR and
-# perturbs the Costas-only solution rather than helping. Lock-retention
-# bottleneck is being investigated separately.
-carrier_loop_bandwidth = 0.01
+# Costas tracks the residual carrier; the operator is expected to have the
+# signal roughly centred (TLE Doppler / manual tune) so only a small offset
+# remains. NCO clamp spans the LEO Doppler swing (~3-4 kHz at 145 MHz over a
+# 4-min pass). 0.02 is wide enough to acquire and track a real pass; the
+# previous 0.01 was tuned around a now-fixed carrier-loop bug. FLL stays off
+# for this clean-ish 1k2 link (Costas alone locks); enable it only for noisier
+# wide-Doppler downlinks.
+carrier_loop_bandwidth = 0.02
 frequency_loop_bandwidth = 0.0
 nco_max_offset_hz = 8000.0
 
