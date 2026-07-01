@@ -294,19 +294,38 @@ pub fn search_linear_iq_alignment_scored(
     let fine_step = (symbol_span / 8).max(1);
     let frequency_offset_hz = *frequency_offset_hz;
 
-    // The 8 polarity combinations (differential x swap_iq x invert) are
+    // The polarity combinations (differential x swap_iq x invert) are
     // independent: each builds its own BitPipeline and reads the prefix
     // without touching shared state, so the sweep parallelises cleanly.
-    let combos: [(bool, bool, bool); 8] = [
-        (*differential, *swap_iq, *invert),
-        (*differential, *swap_iq, !*invert),
-        (*differential, !*swap_iq, *invert),
-        (*differential, !*swap_iq, !*invert),
-        (!*differential, *swap_iq, *invert),
-        (!*differential, *swap_iq, !*invert),
-        (!*differential, !*swap_iq, *invert),
-        (!*differential, !*swap_iq, !*invert),
-    ];
+    //
+    // When the codec applies its own differential (NRZ-S) decode after the
+    // inner Viterbi -- as CCSDS Concatenated does via the pipeline's
+    // `inner_nrzs` stage -- the demodulator-level `differential` must stay at
+    // the configured value. Toggling it there differentially-decodes the
+    // convolutionally-coded channel symbols *before* Viterbi, on top of the
+    // post-Viterbi NRZ-S, which corrupts the code so the ASM never forms. The
+    // wrong setting can still score higher on a short, signal-acquiring prefix
+    // (a couple of noise-driven false syncs), so exclude it from the search
+    // rather than let the scorer pick it. See the differential_gating_tests.
+    let combos: Vec<(bool, bool, bool)> = if codec_handles_differential(downlink) {
+        vec![
+            (*differential, *swap_iq, *invert),
+            (*differential, *swap_iq, !*invert),
+            (*differential, !*swap_iq, *invert),
+            (*differential, !*swap_iq, !*invert),
+        ]
+    } else {
+        vec![
+            (*differential, *swap_iq, *invert),
+            (*differential, *swap_iq, !*invert),
+            (*differential, !*swap_iq, *invert),
+            (*differential, !*swap_iq, !*invert),
+            (!*differential, *swap_iq, *invert),
+            (!*differential, *swap_iq, !*invert),
+            (!*differential, !*swap_iq, *invert),
+            (!*differential, !*swap_iq, !*invert),
+        ]
+    };
 
     let per_combo = |&(candidate_differential, candidate_swap_iq, candidate_invert): &(
         bool,
@@ -1502,6 +1521,17 @@ fn pack_syncword_payload(downlink: &DownlinkDef) -> bool {
     !matches!(codec_kind(downlink), Some(CodecKind::Ao40Fec))
 }
 
+/// True when the codec undoes differential (NRZ-S) encoding itself, after the
+/// inner Viterbi -- as CCSDS Concatenated does via the pipeline's `inner_nrzs`
+/// stage. For such downlinks the demodulator-level `differential` polarity is
+/// fixed at the configured value and must be excluded from the IQ alignment
+/// search: toggling it there differentially-decodes the convolutionally-coded
+/// channel symbols before Viterbi (on top of the post-Viterbi NRZ-S), which
+/// corrupts the code so the attached sync marker never forms.
+pub(crate) fn codec_handles_differential(downlink: &DownlinkDef) -> bool {
+    matches!(codec_kind(downlink), Some(CodecKind::CcsdsConcat { .. }))
+}
+
 fn codec_kind(downlink: &DownlinkDef) -> Option<CodecKind> {
     match &downlink.codec {
         Some(CodecDef::Ax25) => Some(CodecKind::Ax25),
@@ -1881,4 +1911,99 @@ fn linear_config_for(
     config.matched_filter_rolloff = *matched_filter_rolloff;
     config.matched_filter_span_symbols = *matched_filter_span_symbols;
     Ok(config)
+}
+
+#[cfg(test)]
+mod differential_gating_tests {
+    use super::codec_handles_differential;
+    use openhoshimi_core::satellite::load_satellite;
+    use std::path::PathBuf;
+
+    fn satellite_dir() -> PathBuf {
+        // crates/runtime -> repo root -> satellites/
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("satellites")
+    }
+
+    /// ASRTU-1 is CCSDS Concatenated: the NRZ-S decode happens after the inner
+    /// Viterbi, so the alignment search must NOT toggle the demod-level
+    /// `differential`. Regression guard for the bug where the polarity scorer
+    /// flipped it on and decoded zero real frames.
+    #[test]
+    fn ccsds_concat_downlink_pins_demod_differential() {
+        let def = load_satellite(&satellite_dir().join("ASRTU-1.toml"))
+            .expect("load ASRTU-1.toml");
+        assert!(!def.downlinks.is_empty());
+        for dl in &def.downlinks {
+            assert!(
+                codec_handles_differential(dl),
+                "ASRTU-1 downlink {:?} must keep demod differential fixed",
+                dl.label
+            );
+        }
+    }
+
+    /// A plain linear downlink whose codec does not undo differential (AO-73,
+    /// AO-40 FEC) still searches both demod polarities.
+    #[test]
+    fn non_ccsds_downlink_searches_differential() {
+        let def = load_satellite(&satellite_dir().join("AO-73.toml")).expect("load AO-73.toml");
+        for dl in &def.downlinks {
+            assert!(
+                !codec_handles_differential(dl),
+                "AO-73 downlink {:?} should search demod differential",
+                dl.label
+            );
+        }
+    }
+
+    /// End-to-end invariant on the scorer: for the real ASRTU-1 CCSDS
+    /// Concatenated downlink, the alignment search must never report a
+    /// demod-level `differential` other than the configured value, no matter
+    /// what it sees. Feeding deterministic noise makes the wrong (flipped)
+    /// polarity just as able to win on spurious syncs as it did on the
+    /// signal-acquiring prefix that triggered the zero-frame regression.
+    #[test]
+    fn scorer_never_flips_ccsds_demod_differential() {
+        use super::search_linear_iq_alignment_scored;
+        use openhoshimi_core::satellite::ModemDef;
+        use openhoshimi_core::IqSample;
+
+        let def = load_satellite(&satellite_dir().join("ASRTU-1.toml")).expect("load ASRTU-1.toml");
+        let downlink = &def.downlinks[0];
+        let ModemDef::Linear {
+            differential: config_differential,
+            ..
+        } = downlink.modem.as_ref().expect("linear modem")
+        else {
+            panic!("ASRTU-1 must be a linear modem");
+        };
+
+        // Deterministic pseudo-random IQ noise (xorshift), ~2 s at 50 kHz.
+        let sample_rate = 50_000u32;
+        let mut state: u32 = 0x1234_5678;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let prefix: Vec<IqSample> = (0..sample_rate as usize * 2)
+            .map(|_| IqSample {
+                i: next(),
+                q: next(),
+            })
+            .collect();
+
+        if let Some(result) =
+            search_linear_iq_alignment_scored(downlink, sample_rate, &prefix, 0.0)
+        {
+            assert_eq!(
+                result.hint.differential, *config_differential,
+                "scorer flipped demod differential for a CCSDS Concatenated downlink"
+            );
+        }
+    }
 }
