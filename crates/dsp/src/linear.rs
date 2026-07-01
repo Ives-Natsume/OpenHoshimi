@@ -556,6 +556,10 @@ impl LinearDemodulator {
     }
 
     fn peak_symbol_sample(&self) -> IqSample {
+        // NOTE: returns the window midpoint, which is only the matched-filter
+        // peak when the symbol clock is exactly centred. RRC downlinks lock
+        // more reliably with the matched filter disabled (integrate-and-dump);
+        // a proper timing-aligned decision instant here is future work.
         let len = self.symbol_samples.len();
         if len == 0 {
             return IqSample::default();

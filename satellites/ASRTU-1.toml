@@ -24,6 +24,15 @@ framing = "CCSDS_CONCAT"
 [downlink.modem]
 kind = "linear"
 mode = "bpsk"
+# Costas tracks the residual carrier; the FLL (Kay discriminator on squared
+# symbols) widens pull-in for the LEO Doppler swing. The operator should have
+# the signal roughly centred. Matched filtering is left off: the integrate-and
+# -dump decision instant locks this 9k6 BPSK reliably, whereas the RRC path's
+# midpoint decision closes the eye (see peak_symbol_sample). Verified decoding
+# real SSDV frames from a recorded pass.
+carrier_loop_bandwidth = 0.05
+frequency_loop_bandwidth = 0.02
+nco_max_offset_hz = 6000.0
 
 [downlink.framer]
 kind = "syncword"
@@ -50,6 +59,15 @@ framing = "CCSDS_CONCAT"
 [downlink.modem]
 kind = "linear"
 mode = "bpsk"
+# Costas tracks the residual carrier; the FLL (Kay discriminator on squared
+# symbols) widens pull-in for the LEO Doppler swing. The operator should have
+# the signal roughly centred. Matched filtering is left off: the integrate-and
+# -dump decision instant locks this 9k6 BPSK reliably, whereas the RRC path's
+# midpoint decision closes the eye (see peak_symbol_sample). Verified decoding
+# real SSDV frames from a recorded pass.
+carrier_loop_bandwidth = 0.05
+frequency_loop_bandwidth = 0.02
+nco_max_offset_hz = 6000.0
 
 [downlink.framer]
 kind = "syncword"
