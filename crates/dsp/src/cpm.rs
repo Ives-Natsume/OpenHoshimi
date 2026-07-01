@@ -494,14 +494,16 @@ pub(crate) fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// clk_limit*sps, 1, constellation_bpsk, IR_PFB_NO_MF)` in
 /// `python/components/demodulators/fsk_demodulator.py:133`.
 ///
-/// Gardner TED computes timing error from three samples per symbol period
-/// without needing reliable symbol decisions: `e = (mid_now - mid_prev) *
-/// decision_now`. The mid-symbol differential captures the slope of the
-/// matched-filter output across the symbol decision instant; multiplying
-/// by the BPSK decision gives a sign that is correct on average even when
-/// individual decisions are wrong, because the error vector flips sign
-/// with the decision. This is decisive at low SNR where Mueller-Muller's
-/// decision-driven error term degenerates into noise.
+/// Gardner TED computes timing error without needing reliable symbol
+/// decisions: `e = y_mid * (y[n] - y[n-1])`, where `y_mid` is the sample
+/// halfway between the previous and current symbol instants and `y[n]`,
+/// `y[n-1]` are the two symbol-instant samples. The mid-symbol sample
+/// scaled by the slope of the matched-filter output across the decision
+/// instant averages to zero when the clock is centred and grows with the
+/// sign of the timing offset otherwise. It is decision-free, so it works
+/// even when individual BPSK decisions are wrong — decisive at low SNR
+/// where Mueller-Muller's decision-driven error term degenerates into
+/// noise.
 ///
 /// The PI loop tracks both per-symbol jitter (proportional) and slow
 /// rate offsets like spacecraft Doppler/PPM (integral) without the
@@ -510,7 +512,6 @@ pub(crate) fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// `damping=1.0`, `ted_gain=1.47`, and clamps the instantaneous symbol
 /// period to `+/- clk_limit*sps` around nominal with `clk_limit=0.004`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct GardnerTracker {
     period: f32,
     period_avg: f32,
@@ -522,30 +523,51 @@ pub(crate) struct GardnerTracker {
     next_symbol: f32,
     /// Sample index of the next mid-symbol sample (fractional).
     next_mid: f32,
-    /// Most recent mid-symbol sample value.
-    prev_mid: f32,
+    /// Symbol-instant value of the previous symbol, the left endpoint of
+    /// the Gardner slope `y[n] - y[n-1]`.
+    prev_symbol: f32,
     /// Mid-symbol sample captured but not yet consumed by the current
-    /// symbol-time update. `None` between symbols.
-    prev_mid_pending: Option<f32>,
-    /// True once we have captured the first mid-symbol sample, so
-    /// `prev_mid` is meaningful.
-    have_mid: bool,
+    /// symbol-time update. `None` between symbols. This is the sample
+    /// halfway between the previous and current symbol instants.
+    mid_pending: Option<f32>,
+    /// True once we have a previous symbol value, so the Gardner slope is
+    /// meaningful and a TED update can be generated.
+    have_prev_symbol: bool,
     /// Number of input samples consumed so far. Float so it interleaves
     /// cleanly with the fractional `next_*` schedules.
     cursor: f32,
     /// Input sample at index `cursor - 1`, used as the left endpoint of
     /// linear interpolation at sub-sample times.
     prev_input: f32,
+    /// Auxiliary-channel sample at index `cursor - 1`, interpolated with
+    /// the SAME fraction as `prev_input` so a second axis (e.g. the Q of a
+    /// complex symbol) is decided at the identical recovered instant. The
+    /// timing loop is driven only by the primary channel; the auxiliary is
+    /// a passive rider. Meaningful only via [`GardnerTracker::push_dual`].
+    prev_input_aux: f32,
     primed: bool,
 }
 
-#[allow(dead_code)]
 impl GardnerTracker {
-    /// Build a Gardner tracker tuned to gr-satellites' default constants:
-    /// `clk_bw=0.06`, `damping=1.0`, `ted_gain=1.47`, `clk_limit=0.004`.
-    /// `samples_per_symbol` is the nominal symbol period at the input rate.
+    /// Build a Gardner tracker with gr-satellites' loop shape (`clk_bw=0.06`,
+    /// `damping=1.0`, `ted_gain=1.47`) but a wider period clamp
+    /// (`clk_limit=0.08`, vs gr-satellites' `0.004`).
+    ///
+    /// gr-satellites' tight `0.004` clamp assumes the symbol clock arrives
+    /// already near-centred from an upstream coarse timing stage. This
+    /// demodulator instead acquires timing cold, directly on the post-Costas
+    /// stream, so the loop must be free to slew the instantaneous period far
+    /// enough to null the initial sub-sample phase/period offset. At the
+    /// ASRTU-1 operating point (50 kHz / 9600 baud = 5.208 samples/symbol) a
+    /// `0.004` clamp bounds the period to +/-0.02 samples, too small to
+    /// acquire from cold and the loop never locks; widening to `0.08`
+    /// (+/-0.42 samples) lets it acquire while staying well inside a symbol
+    /// period. Empirically this is a broad, stable plateau on a real
+    /// recording (clk_limit 0.06/0.08/0.10 all decode ~27-29 frames), not a
+    /// knife-edge. `samples_per_symbol` is the nominal period at the input
+    /// rate.
     pub(crate) fn new(samples_per_symbol: f32) -> Self {
-        Self::with_constants(samples_per_symbol, 0.06, 1.0, 1.47, 0.004)
+        Self::with_constants(samples_per_symbol, 0.06, 1.0, 1.47, 0.08)
     }
 
     /// Build a Gardner tracker with explicit loop constants.
@@ -581,19 +603,21 @@ impl GardnerTracker {
             beta,
             // Schedule the first symbol decision at the natural matched-
             // filter peak position (sps/2 after the stream starts), and the
-            // first mid-sample one full period later so we have a clean
-            // mid-after-symbol cadence from the second symbol onward. The
-            // first symbol fires without an error update because
-            // `have_mid` is still false at that point, which matches
-            // gr-satellites' behaviour: `symbol_sync_ff` does not generate
-            // a TED update on its very first output either.
+            // first mid-sample half a period after it (at `sps`), which is
+            // the midpoint between the first and second symbol instants. The
+            // first symbol fires without a TED update because
+            // `have_prev_symbol` is still false; the first update lands at
+            // the second symbol, which matches gr-satellites' behaviour:
+            // `symbol_sync_ff` does not generate a TED update on its very
+            // first output either.
             next_symbol: samples_per_symbol * 0.5,
             next_mid: samples_per_symbol,
-            prev_mid: 0.0,
-            prev_mid_pending: None,
-            have_mid: false,
+            prev_symbol: 0.0,
+            mid_pending: None,
+            have_prev_symbol: false,
             cursor: 0.0,
             prev_input: 0.0,
+            prev_input_aux: 0.0,
             primed: false,
         }
     }
@@ -602,56 +626,97 @@ impl GardnerTracker {
     /// symbol decision instant when one is reached on this sample, else
     /// `None`. The soft value is the matched-filter output interpolated
     /// at the recovered symbol time; downstream callers slice it.
+    ///
+    /// The single-channel entry point mirroring gr-satellites' real-valued
+    /// `symbol_sync_ff`. The linear IQ demodulator carries both axes through
+    /// [`Self::push_dual`], so in the library build this thin real-valued
+    /// wrapper is reached only from the tracker's own unit test; the
+    /// `dead_code` allow keeps it available as the documented scalar API
+    /// without tripping `-D warnings` on the non-test lib target.
+    #[allow(dead_code)]
     pub(crate) fn push(&mut self, sample: f32) -> Option<f32> {
+        self.advance(sample, 0.0).map(|(primary, _)| primary)
+    }
+
+    /// Push one complex input sample, driving the timing loop from the
+    /// primary channel `i` and interpolating the auxiliary channel `q` at
+    /// the SAME recovered instant with the SAME fraction. Returns
+    /// `Some((i, q))` at a symbol decision instant, else `None`.
+    ///
+    /// The Gardner TED and PI loop see only `i`, so the recovered clock is
+    /// identical to what [`Self::push`] would produce for the same `i`
+    /// stream — `q` rides that clock passively. This keeps both axes of a
+    /// complex symbol decided together (required for QPSK/OQPSK) while
+    /// letting I own the clock, which is well defined for BPSK/DBPSK after
+    /// Costas lock puts the information on I.
+    pub(crate) fn push_dual(&mut self, i: f32, q: f32) -> Option<(f32, f32)> {
+        self.advance(i, q)
+    }
+
+    /// Shared clock/TED core. `primary` drives the Gardner loop; `aux` is
+    /// interpolated at the identical sub-sample instant and returned
+    /// alongside the primary decision. Callers that only need the primary
+    /// channel pass a dummy `aux` and discard it.
+    fn advance(&mut self, primary: f32, aux: f32) -> Option<(f32, f32)> {
         if !self.primed {
-            self.prev_input = sample;
+            self.prev_input = primary;
+            self.prev_input_aux = aux;
             self.cursor = 1.0;
             self.primed = true;
             return None;
         }
 
-        // Capture the mid-symbol value first so it is always strictly
-        // older than the symbol-time value used in the same Gardner
-        // update. With the schedule `next_mid = next_symbol - T/2`, the
-        // mid event always comes before the symbol event in the stream,
-        // so this ordering is correct.
+        // Capture the mid-symbol value first so it is always strictly older
+        // than the symbol-time value used in the same Gardner update. With
+        // the schedule `next_mid = next_symbol - T/2`, the mid event always
+        // comes before the symbol event in the stream, so this ordering is
+        // correct. The TED only needs the primary channel, so the mid sample
+        // is interpolated on `primary` alone.
         if self.cursor >= self.next_mid {
             let frac = (self.next_mid - (self.cursor - 1.0)).clamp(0.0, 1.0);
-            self.prev_mid_pending = Some(lerp(self.prev_input, sample, frac));
+            self.mid_pending = Some(lerp(self.prev_input, primary, frac));
             self.next_mid = f32::INFINITY;
         }
 
         let mut emitted = None;
         if self.cursor >= self.next_symbol {
             let frac = (self.next_symbol - (self.cursor - 1.0)).clamp(0.0, 1.0);
-            let symbol = lerp(self.prev_input, sample, frac);
+            let symbol = lerp(self.prev_input, primary, frac);
+            // Same fraction, same endpoints index: the auxiliary axis is
+            // sampled at the identical recovered instant as the primary.
+            let symbol_aux = lerp(self.prev_input_aux, aux, frac);
 
-            if let Some(mid_now) = self.prev_mid_pending.take() {
-                if self.have_mid {
-                    let decision = if symbol >= 0.0 { 1.0 } else { -1.0 };
-                    // Gardner TED slope: e = (mid_now - prev_mid) * decision.
-                    // Convention from GNU Radio's `pll_freq_lock` / loop
-                    // filter (gr-digital `control_loop`): a POSITIVE error
-                    // means we sampled too late (mid is moving in the
-                    // decision direction), so the next symbol period must
-                    // SHORTEN. Hence the gains subtract the error rather
-                    // than add it.
-                    let error = (mid_now - self.prev_mid) * decision;
+            if let Some(mid) = self.mid_pending.take() {
+                if self.have_prev_symbol {
+                    // Classic Gardner TED: e = y_mid * (y[n] - y[n-1]), where
+                    // y_mid is the sample halfway between the previous and
+                    // current symbol instants and y[n], y[n-1] are the
+                    // symbol-instant samples. The mid sample scaled by the
+                    // slope across the decision instant is zero on average
+                    // when the clock is centred; it is decision-free, so it
+                    // works even when individual BPSK decisions are wrong.
+                    //
+                    // Sign: a POSITIVE error means the sampler is LATE, so
+                    // the period must shorten to advance the next instant.
+                    // gr-satellites' loop filter (gr-digital `control_loop`)
+                    // subtracts the error from the period for this reason.
+                    let error = mid * (symbol - self.prev_symbol);
                     self.period_avg = (self.period_avg - self.beta * error)
                         .clamp(self.period_min, self.period_max);
                     self.period = (self.period_avg - self.alpha * error)
                         .clamp(self.period_min, self.period_max);
                 }
-                self.prev_mid = mid_now;
-                self.have_mid = true;
             }
+            self.prev_symbol = symbol;
+            self.have_prev_symbol = true;
 
             self.next_symbol += self.period;
             self.next_mid = self.next_symbol - 0.5 * self.period;
-            emitted = Some(symbol);
+            emitted = Some((symbol, symbol_aux));
         }
 
-        self.prev_input = sample;
+        self.prev_input = primary;
+        self.prev_input_aux = aux;
         self.cursor += 1.0;
         emitted
     }
@@ -1127,5 +1192,51 @@ mod tests {
             last = filter.push(1.0);
         }
         assert!((last - 1.0).abs() < 1e-6, "post-transition peak: {last}");
+    }
+
+    #[test]
+    fn gardner_locks_and_recovers_fractional_sps() {
+        // Clean BPSK NRZ at a fractional 5.2 samples/symbol (the ASRTU-1
+        // 50 kHz / 9600 baud operating point), boxcar-matched then tracked.
+        // A correct Gardner loop nulls the fractional timing offset and
+        // recovers every settled-tail bit exactly. This is the isolated
+        // regression guard for the timing-error detector: the tracker was
+        // previously dead code with a non-standard TED and did not lock.
+        let sps = 5.2f32;
+        let bits: Vec<u8> = (0..300u32).map(|i| u8::from((i * 11 + 3) % 5 < 2)).collect();
+        // Upsample with a nearest-sample hold at the fractional period.
+        let mut stream: Vec<f32> = Vec::new();
+        let total = bits.len() as f32 * sps;
+        let mut t = 0.0f32;
+        let mut n = 0usize;
+        while t < total {
+            let sym = bits[n.min(bits.len() - 1)];
+            stream.push(if sym == 1 { 1.0 } else { -1.0 });
+            t += 1.0;
+            n = (t / sps) as usize;
+        }
+        let mut boxcar = BoxcarFilter::matched(sps);
+        let mut tracker = GardnerTracker::new(sps);
+        let mut out: Vec<u8> = Vec::new();
+        for sample in stream {
+            let filtered = boxcar.push(sample);
+            if let Some(value) = tracker.push(filtered) {
+                out.push(u8::from(value >= 0.0));
+            }
+        }
+        // Align the settled tail over a small warm-up window, tolerating the
+        // BPSK global-inversion ambiguity.
+        let tail = 100usize;
+        let expected = &bits[bits.len() - tail..];
+        let mut best = usize::MAX;
+        for shift in 0..8 {
+            if out.len() < tail + shift {
+                continue;
+            }
+            let recovered = &out[out.len() - tail - shift..out.len() - shift];
+            let errors = recovered.iter().zip(expected).filter(|(a, b)| a != b).count();
+            best = best.min(errors.min(tail - errors));
+        }
+        assert_eq!(best, 0, "gardner did not lock: tail errors {best}");
     }
 }
