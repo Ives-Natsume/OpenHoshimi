@@ -150,6 +150,54 @@ impl SyncwordFramer {
         frames
     }
 
+    /// Hard-decision syncword detection identical to [`push_bits`](Self::push_bits)
+    /// that additionally threads a per-bit reliability stream (`soft`, aligned
+    /// 1:1 with `bits`) into the emitted frames' `soft_bits`. The sync search
+    /// and payload slicing are unchanged -- only the payload's reliabilities
+    /// are collected alongside its bits -- so callers that supply reliabilities
+    /// behave exactly like [`push_bits`](Self::push_bits) at the framing level
+    /// while giving the codec what it needs for errors-and-erasures decoding.
+    /// Only the magnitude of each `soft` value is meaningful downstream.
+    pub fn push_bits_with_soft(&mut self, bits: &[u8], soft: &[f32]) -> Vec<Frame> {
+        let mut frames = Vec::new();
+
+        for (idx, &bit) in bits.iter().enumerate() {
+            let bit = bit & 1;
+            let confidence = soft.get(idx).copied().unwrap_or(0.0);
+            if self.collecting {
+                self.current_payload.push(bit);
+                self.current_payload_soft.push(confidence);
+                if self.current_payload.len() == self.payload_bits {
+                    let payload = std::mem::take(&mut self.current_payload);
+                    let soft_payload = std::mem::take(&mut self.current_payload_soft);
+                    frames.push(self.frame_from_bits(payload, Some(soft_payload)));
+                    self.current_payload = Vec::with_capacity(self.payload_bits);
+                    self.current_payload_soft = Vec::with_capacity(self.payload_bits);
+                    self.collecting = false;
+                    self.shift_register.clear();
+                }
+                continue;
+            }
+
+            self.shift_register.push(bit);
+            if self.shift_register.len() > self.syncword.len() {
+                self.shift_register.remove(0);
+            }
+
+            if self.shift_register.len() == self.syncword.len() {
+                self.sync_attempts = self.sync_attempts.saturating_add(1);
+                if hamming_distance(&self.shift_register, &self.syncword) <= self.threshold {
+                    self.sync_locked = self.sync_locked.saturating_add(1);
+                    self.collecting = true;
+                    self.current_payload.clear();
+                    self.current_payload_soft.clear();
+                }
+            }
+        }
+
+        frames
+    }
+
     /// Push one soft (pre-slicer) signal value per symbol and return
     /// complete payload bit vectors.
     ///
@@ -309,6 +357,47 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].raw, vec![0xa3]);
         assert_eq!(frames[0].frame_type, FrameType::GomspaceAx100);
+    }
+
+    #[test]
+    fn push_bits_with_soft_attaches_aligned_payload_reliabilities() {
+        // Same framing as can_emit_packed_frames, but with a parallel soft
+        // stream. The sync search must be unchanged and the emitted frame must
+        // carry exactly the payload's soft values (not the syncword's), in
+        // order.
+        let mut framer =
+            SyncwordFramer::with_frame_options(&[1, 0, 1, 1], 0, 8, FrameType::Ccsds, true);
+
+        let bits = [1u8, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1];
+        // Distinct per-bit confidences so misalignment would be visible.
+        let soft: Vec<f32> = (0..bits.len()).map(|i| (i + 1) as f32).collect();
+
+        let frames = framer.push_bits_with_soft(&bits, &soft);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].raw, vec![0xa3]);
+        // Payload is the 8 bits after the 4-bit syncword: soft indices 4..12.
+        assert_eq!(
+            frames[0].soft_bits.as_deref(),
+            Some(&[5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0][..])
+        );
+    }
+
+    #[test]
+    fn push_bits_with_soft_matches_hard_framing() {
+        // The soft variant must lock and slice identically to push_bits.
+        let mut hard = SyncwordFramer::new(&[1, 0, 1, 1], 1, 4);
+        let mut soft = SyncwordFramer::with_frame_options(
+            &[1, 0, 1, 1],
+            1,
+            4,
+            FrameType::Ccsds,
+            false,
+        );
+        let bits = [0u8, 0, 1, 0, 0, 1, 1, 0, 1, 1];
+        let hard_frames = hard.push_bits(&bits);
+        let soft_frames = soft.push_bits_with_soft(&bits, &vec![1.0; bits.len()]);
+        assert_eq!(hard_frames.len(), soft_frames.len());
     }
 
     #[test]

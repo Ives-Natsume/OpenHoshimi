@@ -913,6 +913,11 @@ where
     /// Viterbi -> diff_decode -> ASM detect). `Some(last_bit)` carries the
     /// previous bit across `push_samples` batches; `None` disables it.
     inner_nrzs: Option<u8>,
+    /// Reliability of the previous Viterbi output bit, carried across batches
+    /// alongside [`Self::inner_nrzs`]. An NRZ-S bit `d[k] = out[k] ^ out[k-1]`
+    /// is only as trustworthy as its least reliable parent, so its soft value
+    /// is `min(rel[k], rel[k-1])`. Unused when `inner_nrzs` is `None`.
+    inner_nrzs_prev_rel: f32,
     framer: FrameStage,
     codec: CodecStage,
     total_samples: u64,
@@ -1005,6 +1010,7 @@ where
             descrambler: build_descrambler(downlink)?,
             inner_viterbi,
             inner_nrzs,
+            inner_nrzs_prev_rel: 0.0,
             framer: build_framer(downlink)?,
             codec: build_codec(downlink)?,
             total_samples: 0,
@@ -1038,13 +1044,25 @@ where
         // Prefer soft-decision Viterbi (~2 dB of coding gain on weak passes)
         // when the demodulator exposes per-symbol soft values aligned 1:1 with
         // the hard bits and no hard-only per-bit transform sits in between.
+        // Per-output-bit reliabilities from the soft Viterbi, aligned 1:1 with
+        // `bits`. Empty on the hard path (no soft input) so the framer stays
+        // hard-decision. Threaded downstream so the outer RS decoder can mark
+        // low-confidence bytes as erasures on frames the errors-only decode
+        // rejects.
+        let mut reliabilities: Vec<f32> = Vec::new();
         if let Some(viterbi) = self.inner_viterbi.as_mut() {
             let soft = demodulator.last_soft_symbols();
             bits = if self.line_decoder.is_none()
                 && self.descrambler.is_none()
                 && soft.len() == bits.len()
             {
-                viterbi.push_soft_symbols(soft)
+                let decoded = viterbi.push_soft_symbols(soft);
+                reliabilities = viterbi
+                    .last_reliabilities()
+                    .iter()
+                    .map(|&r| r as f32)
+                    .collect();
+                decoded
             } else {
                 viterbi.push_symbols(&bits)
             };
@@ -1055,11 +1073,21 @@ where
         // gr-satellites topology (Viterbi -> diff_decode -> ASM detect) and
         // resolves the BPSK 180-degree phase ambiguity (XOR of consecutive
         // bits is invariant to global inversion).
+        // Propagate reliabilities through NRZ-S in lockstep: the decoded bit
+        // `d[k] = out[k] ^ out[k-1]` is only as reliable as its weaker parent,
+        // so `rel_d[k] = min(rel[k], rel[k-1])`, carrying the previous bit's
+        // reliability across batches beside the previous bit itself.
         if let Some(prev) = self.inner_nrzs.as_mut() {
-            for bit in bits.iter_mut() {
+            let track_rel = reliabilities.len() == bits.len();
+            for (idx, bit) in bits.iter_mut().enumerate() {
                 let cur = *bit & 1;
                 *bit = cur ^ *prev;
                 *prev = cur;
+                if track_rel {
+                    let cur_rel = reliabilities[idx];
+                    reliabilities[idx] = cur_rel.min(self.inner_nrzs_prev_rel);
+                    self.inner_nrzs_prev_rel = cur_rel;
+                }
             }
         }
 
@@ -1078,6 +1106,10 @@ where
             } else {
                 self.framer.push_bits(&bits)
             }
+        } else if reliabilities.len() == bits.len() {
+            // CCSDS path: carry the per-bit reliabilities into the frame so the
+            // outer RS stage can attempt errors-and-erasures decoding.
+            self.framer.push_bits_with_soft(&bits, &reliabilities)
         } else {
             self.framer.push_bits(&bits)
         };
@@ -1369,6 +1401,18 @@ impl FrameStage {
             Self::Ao40(framer) => framer.push_bytes(bits),
             Self::Hdlc(framer) => framer.push_bytes(bits),
             Self::Syncword(framer) => framer.push_bytes(bits),
+        }
+    }
+
+    /// Hard-decision framing (identical sync detection to [`Self::push_bits`])
+    /// that also threads a per-bit reliability stream, aligned 1:1 with
+    /// `bits`, into the emitted frames' `soft_bits`. Only [`SyncwordFramer`]
+    /// carries it; the others ignore the soft stream. Used by the CCSDS
+    /// Concatenated path to feed the outer RS errors-and-erasures decoder.
+    fn push_bits_with_soft(&mut self, bits: &[u8], soft: &[f32]) -> Vec<Frame> {
+        match self {
+            Self::Syncword(framer) => framer.push_bits_with_soft(bits, soft),
+            Self::Ao40(_) | Self::Hdlc(_) => self.push_bits(bits),
         }
     }
 
@@ -1693,11 +1737,42 @@ impl CodecStage {
             Self::CcsdsConcat(decoder) => {
                 // The streaming Viterbi decoder already ran in the pipeline,
                 // so frame.raw contains the Viterbi-decoded RS codeword (255
-                // bytes). Use decode_frame_bytes which does differential +
-                // descramble + RS.
-                let decoded = decoder
-                    .decode_frame_bytes(&frame.raw)
-                    .map_err(|err| format!("CCSDS Concatenated decode failed: {err}"))?;
+                // bytes). decode_frame_bytes does descramble + RS.
+                //
+                // When the framer carried per-bit Viterbi reliabilities
+                // through, retry frames that exceed the 16-symbol errors-only
+                // reach with errors-and-erasures RS: the K least-reliable
+                // bytes are marked as erasures, and RS resolves the codeword
+                // while 2*errors + erasures <= 32. decode_frame_bytes_with_soft
+                // tries errors-only first, so clean frames are unaffected.
+                //
+                // K is OPENHOSHIMI_CCSDS_ERASURE_K, default 16. It must stay
+                // well below the 32-symbol erasure budget: at K=32 the 223
+                // information symbols are fully determined by the 223 unerased
+                // symbols, so RS "decodes" any input -- including a noise-driven
+                // false sync -- into a valid-looking codeword. This link has no
+                // frame CRC to catch that, so a conservative K keeps the code
+                // over-determined enough to reject noise, and the sanity gate
+                // below drops anything that still reports the maximum count.
+                let erasure_k = std::env::var("OPENHOSHIMI_CCSDS_ERASURE_K")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(16);
+                let decoded = match frame.soft_bits.as_deref() {
+                    Some(soft) if soft.len() == frame.raw.len() * 8 && erasure_k > 0 => {
+                        decoder.decode_frame_bytes_with_soft(&frame.raw, soft, erasure_k)
+                    }
+                    _ => decoder.decode_frame_bytes(&frame.raw),
+                }
+                .map_err(|err| format!("CCSDS Concatenated decode failed: {err}"))?;
+                // RS(255,223) sanity gate: corrected_errors == nroots (32) is
+                // only reachable by full erasure forcing, which turns noise
+                // into a garbage codeword. Reject rather than surface it.
+                if decoded.corrected_errors >= 32 {
+                    return Err("CCSDS Concatenated decode failed: erasure-forced \
+                                (corrected == nroots), rejecting as false positive"
+                        .to_string());
+                }
                 Ok(DecodedFrame::Ao40 {
                     payload: decoded.payload,
                     corrected_errors: decoded.corrected_errors,
