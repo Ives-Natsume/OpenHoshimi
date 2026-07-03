@@ -24,15 +24,19 @@ framing = "CCSDS_CONCAT"
 [downlink.modem]
 kind = "linear"
 mode = "bpsk"
-# Costas tracks the residual carrier; the FLL (Kay discriminator on squared
-# symbols) widens pull-in for the LEO Doppler swing. The operator should have
-# the signal roughly centred. Matched filtering is left off: the integrate-and
-# -dump decision instant locks this 9k6 BPSK reliably, whereas the RRC path's
-# midpoint decision closes the eye (see peak_symbol_sample). Verified decoding
-# real SSDV frames from a recorded pass.
+# Acquisition chain: a band-edge FLL (GNU-Radio digital_fll_band_edge_cc) does
+# coarse frequency acquisition with a wide +/-~2*baud (~19.2 kHz) pull-in, then
+# the Costas loop tracks the residual carrier phase. The band-edge FLL
+# supersedes the Kay squared-symbol FLL (frequency_loop_bandwidth) when active,
+# so the two frequency loops never fight. matched_filter_rolloff (0.35) only
+# feeds the band-edge filter design; matched filtering is left OFF in the
+# decision path (integrate-and-dump locks this 9k6 BPSK; the RRC midpoint
+# decision closes the eye, see peak_symbol_sample). Verified decoding real SSDV
+# frames from a recorded pass.
 carrier_loop_bandwidth = 0.05
 frequency_loop_bandwidth = 0.02
 nco_max_offset_hz = 6000.0
+fll_band_edge_bw = 0.01
 
 [downlink.framer]
 kind = "syncword"
@@ -59,15 +63,19 @@ framing = "CCSDS_CONCAT"
 [downlink.modem]
 kind = "linear"
 mode = "bpsk"
-# Costas tracks the residual carrier; the FLL (Kay discriminator on squared
-# symbols) widens pull-in for the LEO Doppler swing. The operator should have
-# the signal roughly centred. Matched filtering is left off: the integrate-and
-# -dump decision instant locks this 9k6 BPSK reliably, whereas the RRC path's
-# midpoint decision closes the eye (see peak_symbol_sample). Verified decoding
-# real SSDV frames from a recorded pass.
+# Acquisition chain: a band-edge FLL (GNU-Radio digital_fll_band_edge_cc) does
+# coarse frequency acquisition with a wide +/-~2*baud (~19.2 kHz) pull-in, then
+# the Costas loop tracks the residual carrier phase. The band-edge FLL
+# supersedes the Kay squared-symbol FLL (frequency_loop_bandwidth) when active,
+# so the two frequency loops never fight. matched_filter_rolloff (0.35) only
+# feeds the band-edge filter design; matched filtering is left OFF in the
+# decision path (integrate-and-dump locks this 9k6 BPSK; the RRC midpoint
+# decision closes the eye, see peak_symbol_sample). Verified decoding real SSDV
+# frames from a recorded pass.
 carrier_loop_bandwidth = 0.05
 frequency_loop_bandwidth = 0.02
 nco_max_offset_hz = 6000.0
+fll_band_edge_bw = 0.01
 
 [downlink.framer]
 kind = "syncword"

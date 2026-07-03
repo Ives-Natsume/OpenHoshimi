@@ -276,6 +276,7 @@ pub fn search_linear_iq_alignment_scored(
         nco_max_offset_hz: _,
         matched_filter_rolloff: _,
         matched_filter_span_symbols: _,
+        fll_band_edge_bw: _,
     } = downlink.modem.as_ref()?
     else {
         return None;
@@ -345,16 +346,18 @@ pub fn search_linear_iq_alignment_scored(
             frequency_loop_bandwidth,
             matched_filter_rolloff,
             matched_filter_span_symbols,
+            fll_band_edge_bw,
             ..
         }) = trial.modem.as_mut()
         {
             *differential = candidate_differential;
             *invert = candidate_invert;
             *trial_swap_iq = candidate_swap_iq;
-            // FLL would slew the NCO during trial scoring and hide
-            // alignment at the candidate offset; disable it here so
+            // Either FLL would slew the NCO during trial scoring and hide
+            // alignment at the candidate offset; disable both here so
             // the per-offset frame count reflects pure Costas lock.
             *frequency_loop_bandwidth = 0.0;
+            *fll_band_edge_bw = 0.0;
             *matched_filter_rolloff = 0.0;
             *matched_filter_span_symbols = 0;
         }
@@ -1289,6 +1292,7 @@ fn build_iq_demodulator(
             nco_max_offset_hz,
             matched_filter_rolloff,
             matched_filter_span_symbols,
+            fll_band_edge_bw,
         }) => {
             let mut config =
                 LinearConfig::new(sample_rate, downlink.baudrate, map_linear_mode(*mode));
@@ -1305,6 +1309,13 @@ fn build_iq_demodulator(
             config.nco_max_offset_hz = *nco_max_offset_hz;
             config.matched_filter_rolloff = *matched_filter_rolloff;
             config.matched_filter_span_symbols = *matched_filter_span_symbols;
+            config.fll_band_edge_bw = *fll_band_edge_bw;
+            // The band-edge filters are designed from the transmit RRC
+            // roll-off; reuse `matched_filter_rolloff` for that value only.
+            // This does NOT enable the RRC decision-path matched filter,
+            // which is gated separately on `matched_filter_rolloff > 0` inside
+            // the demodulator.
+            config.fll_band_edge_rolloff = *matched_filter_rolloff;
             Ok(Box::new(LinearDemodulator::new(config).map_err(|err| {
                 format!("failed to configure linear demodulator: {err}")
             })?))
@@ -1964,6 +1975,7 @@ fn linear_config_for(
         nco_max_offset_hz,
         matched_filter_rolloff,
         matched_filter_span_symbols,
+        fll_band_edge_bw,
     }) = downlink.modem.as_ref()
     else {
         return Err(format!(
@@ -1985,6 +1997,10 @@ fn linear_config_for(
     config.nco_max_offset_hz = *nco_max_offset_hz;
     config.matched_filter_rolloff = *matched_filter_rolloff;
     config.matched_filter_span_symbols = *matched_filter_span_symbols;
+    config.fll_band_edge_bw = *fll_band_edge_bw;
+    // Design the band-edge filters from the transmit RRC roll-off; this reuse
+    // does not turn on the RRC decision-path matched filter (gated separately).
+    config.fll_band_edge_rolloff = *matched_filter_rolloff;
     Ok(config)
 }
 

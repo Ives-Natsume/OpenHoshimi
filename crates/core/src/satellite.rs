@@ -207,6 +207,16 @@ pub enum ModemDef {
         /// `matched_filter_rolloff > 0`. `0` selects a default (six symbols).
         #[serde(default)]
         matched_filter_span_symbols: usize,
+        /// Band-edge FLL loop bandwidth, normalized to the symbol rate. When
+        /// `> 0.0` a GNU-Radio `digital_fll_band_edge_cc` runs ahead of the
+        /// Costas loop for wide (`±~2*baudrate`) frequency acquisition. `0.0`
+        /// disables it (default). When active, the Kay squared-symbol FLL
+        /// (`frequency_loop_bandwidth`) is suppressed so the two frequency
+        /// loops do not fight. The band-edge filters are designed from
+        /// `matched_filter_rolloff` (or 0.35 if that is zero); this does NOT
+        /// turn on the RRC decision-path matched filter.
+        #[serde(default)]
+        fll_band_edge_bw: f32,
     },
     /// LoRa modem placeholder.
     Lora {
@@ -1262,6 +1272,7 @@ warn_above = 8.4
                 nco_max_offset_hz,
                 matched_filter_rolloff,
                 matched_filter_span_symbols,
+                fll_band_edge_bw,
             }) => {
                 assert_eq!(*mode, LinearModeDef::Dbpsk);
                 assert_eq!(*frequency_offset_hz, -6000.0);
@@ -1273,6 +1284,7 @@ warn_above = 8.4
                 assert_eq!(*nco_max_offset_hz, 0.0);
                 assert_eq!(*matched_filter_rolloff, 0.0);
                 assert_eq!(*matched_filter_span_symbols, 0);
+                assert_eq!(*fll_band_edge_bw, 0.0);
             }
             other => panic!("expected linear modem, got {other:?}"),
         }

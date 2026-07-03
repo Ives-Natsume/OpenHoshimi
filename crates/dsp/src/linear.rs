@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use openhoshimi_core::{DecodeError, Demodulator, IqSample};
 
 use crate::cpm::{BoxcarFilter, GardnerTracker};
+use crate::fll::BandEdgeFll;
 
 /// Process-wide debug sink for post-Costas symbol decisions. Each line is
 /// `i,q\n` of the IQ value handed to the slicer. Enabled by
@@ -98,6 +99,21 @@ pub struct LinearConfig {
     /// [`Self::matched_filter_rolloff`] is greater than zero. `0` selects a
     /// reasonable default span (six symbols).
     pub matched_filter_span_symbols: usize,
+    /// Band-edge FLL loop bandwidth, normalized to the symbol rate. When
+    /// `> 0.0` a GNU-Radio-style `digital_fll_band_edge_cc` runs per sample
+    /// ahead of the carrier correction and Costas loop, giving a wide
+    /// (`±~2*baudrate`) frequency acquisition that the phase loops cannot.
+    /// `0.0` disables it. It cascades with, rather than replaces, the Kay
+    /// squared-symbol FLL ([`Self::frequency_loop_bandwidth`]) and the Costas
+    /// loop: the band-edge FLL takes the coarse wide lock on the raw samples,
+    /// then the Costas/Kay loops clean up residual phase and Doppler.
+    pub fll_band_edge_bw: f32,
+    /// Band-edge FLL RRC roll-off used to design the band-edge filters. Only
+    /// consulted when [`Self::fll_band_edge_bw`] is greater than zero. This is
+    /// independent of [`Self::matched_filter_rolloff`]'s use for the RRC
+    /// decision-path matched filter; if this is `0.0` while the FLL is on, a
+    /// default of `0.35` is used.
+    pub fll_band_edge_rolloff: f32,
 }
 
 impl LinearConfig {
@@ -116,6 +132,8 @@ impl LinearConfig {
             nco_max_offset_hz: 0.0,
             matched_filter_rolloff: 0.0,
             matched_filter_span_symbols: 0,
+            fll_band_edge_bw: 0.0,
+            fll_band_edge_rolloff: 0.0,
         }
     }
 }
@@ -169,6 +187,10 @@ pub struct LinearDemodulator {
     /// -> positive, bit `1` -> negative, magnitude = reliability). Populated
     /// for binary (BPSK/DBPSK) modes so the streaming Viterbi can run soft.
     last_soft_i8: Vec<i8>,
+    /// Band-edge FLL for wide frequency acquisition, applied per sample after
+    /// AGC/DC-block and before the carrier correction / Costas loop. `None`
+    /// when `fll_band_edge_bw <= 0.0`.
+    band_edge_fll: Option<BandEdgeFll>,
 }
 
 impl LinearDemodulator {
@@ -177,17 +199,54 @@ impl LinearDemodulator {
         validate_config(config)?;
         let samples_per_symbol = config.sample_rate as f32 / config.baudrate as f32;
         let (loop_alpha, loop_beta) = loop_filter_gains(config.carrier_loop_bandwidth);
+        // Acquisition cascade: the band-edge FLL (below) derotates the raw
+        // samples for a wide coarse frequency lock, THEN correct_frequency runs
+        // the Costas phase loop and the Kay squared-symbol FLL on the result
+        // for fine residual/Doppler tracking. The two FLLs drive independent
+        // NCOs in series (band-edge on the raw stream, Kay inside
+        // correct_frequency), so they do not fight -- and both are needed:
+        // dropping the Kay FLL here collapses ASRTU-1 decode to zero because
+        // the band-edge lock alone leaves too much residual for the Gardner
+        // timing loop, whereas keeping both recovers 52/52 contiguous frames.
+        let band_edge_active = config.fll_band_edge_bw > 0.0;
         let freq_loop_alpha = if config.frequency_loop_bandwidth > 0.0 {
             config.frequency_loop_bandwidth
         } else {
             0.0
+        };
+        let band_edge_fll = if band_edge_active {
+            let rolloff = if config.fll_band_edge_rolloff > 0.0 {
+                config.fll_band_edge_rolloff
+            } else {
+                0.35
+            };
+            // Span ~20 symbols like the reference, capped so the per-sample
+            // FIRs stay affordable at high sample rates.
+            let fsize = ((20.0 * samples_per_symbol).round() as usize).clamp(8, 1024);
+            Some(BandEdgeFll::new(
+                samples_per_symbol,
+                rolloff,
+                fsize,
+                config.fll_band_edge_bw,
+            ))
+        } else {
+            None
         };
         let nco_limit_radians = if config.nco_max_offset_hz > 0.0 {
             TAU * config.nco_max_offset_hz / config.sample_rate as f32
         } else {
             TAU * config.baudrate as f32 / config.sample_rate as f32
         };
-        let matched_taps = if config.matched_filter_rolloff > 0.0 {
+        // The RRC decision-path matched filter and the band-edge FLL's
+        // band-edge design both read a roll-off value, but from DIFFERENT
+        // config fields so callers can feed the FLL a roll-off without turning
+        // on the RRC decision path (prior A/B showed the RRC midpoint-decision
+        // path regresses ASRTU-1). The RRC matched filter is driven solely by
+        // `matched_filter_rolloff`; the FLL roll-off is `fll_band_edge_rolloff`
+        // (see above). When the band-edge FLL is active we additionally force
+        // the RRC decision path off as a belt-and-braces guard, since the
+        // pipeline feeds `matched_filter_rolloff` into the FLL roll-off.
+        let matched_taps = if config.matched_filter_rolloff > 0.0 && !band_edge_active {
             let span = if config.matched_filter_span_symbols == 0 {
                 6
             } else {
@@ -234,6 +293,7 @@ impl LinearDemodulator {
             matched_buffer_q: vec![0.0; buffer_len],
             matched_index: 0,
             last_soft_i8: Vec::new(),
+            band_edge_fll,
         })
     }
 
@@ -416,6 +476,15 @@ impl LinearDemodulator {
         }
     }
 
+    /// Apply the band-edge FLL if configured, returning the derotated sample.
+    /// A no-op when the FLL is disabled.
+    fn apply_band_edge_fll(&mut self, sample: IqSample) -> IqSample {
+        match self.band_edge_fll.as_mut() {
+            Some(fll) => fll.process(sample),
+            None => sample,
+        }
+    }
+
     fn correct_frequency(&mut self, sample: IqSample) -> IqSample {
         let phase = self.carrier_phase;
         let sin = phase.sin();
@@ -567,6 +636,9 @@ impl LinearDemodulator {
         for &sample in samples {
             let sample = self.normalize_sample(sample);
             let sample = self.apply_dc_block_and_agc(sample);
+            // Band-edge FLL: wide coarse frequency acquisition ahead of the
+            // narrow Costas/Kay phase loops. No-op unless configured.
+            let sample = self.apply_band_edge_fll(sample);
             let sample = self.correct_frequency(sample);
             let filtered = self.matched_filter(sample);
             let filtered = self.symbol_matched_filter(filtered);
@@ -596,6 +668,9 @@ impl Demodulator for LinearDemodulator {
         for &sample in samples {
             let sample = self.normalize_sample(sample);
             let sample = self.apply_dc_block_and_agc(sample);
+            // Band-edge FLL: wide coarse frequency acquisition ahead of the
+            // narrow Costas/Kay phase loops. No-op unless configured.
+            let sample = self.apply_band_edge_fll(sample);
             let sample = self.correct_frequency(sample);
             let filtered = self.matched_filter(sample);
             let filtered = self.symbol_matched_filter(filtered);
