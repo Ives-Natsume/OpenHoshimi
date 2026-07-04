@@ -349,7 +349,19 @@ impl LinearDemodulator {
         } else {
             // Hard bit matches `slice_binary`: i >= 0 -> 1. Encoding bit 0 as
             // positive then requires the negated in-phase projection.
-            (u8::from(current.i >= 0.0), -normalize_in_phase(current))
+            //
+            // normalize_in_phase() divides out the symbol magnitude, so it
+            // reports cos(theta) alone -- a near-noise symbol whose tiny i,q
+            // happen to align on-axis still claims full confidence, throwing
+            // away the fade/SNR information the amplitude carries. Re-attach an
+            // amplitude reliability bounded to 1: a confident-amplitude symbol
+            // (|s| >= ref) keeps exactly its previous soft value (the soft
+            // Viterbi metric is calibrated to +/-SOFT_CENTER and must never be
+            // scaled up), while a faded symbol is deweighted toward zero.
+            let cos = -normalize_in_phase(current);
+            let amp = current.i.hypot(current.q);
+            let reliability = (amp / SOFT_DECISION_AMP_REF).min(1.0);
+            (u8::from(current.i >= 0.0), cos * reliability)
         };
 
         if self.config.invert {
@@ -819,6 +831,16 @@ fn normalize_in_phase(sample: IqSample) -> f32 {
         0.0
     }
 }
+
+/// Reference symbol amplitude at which a soft decision is considered fully
+/// reliable. The AGC (see `apply_dc_block_and_agc`) drives the sample stream
+/// to unit power, so a well-formed symbol lands near |s| = 1; symbols weaker
+/// than this are faded/noisy and get their soft value scaled down in
+/// proportion to |s| (see `slice_binary_paired`). Chosen at the AGC target so
+/// the whole confident cluster (|s| >= 1) keeps its previous soft value
+/// unchanged; a sweep on a real pass showed 1.0-1.25 is the knee (1.25 already
+/// deweights ~84% of symbols and starts dropping frames).
+const SOFT_DECISION_AMP_REF: f32 = 1.0;
 
 /// Map a signed correlation value to a soft-decision symbol.
 ///
