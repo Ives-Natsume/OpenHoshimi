@@ -368,6 +368,7 @@ pub fn search_linear_iq_alignment_scored(
                 return None;
             }
             let mut pipeline = BitPipeline::<IqSample>::new(&trial).ok()?;
+            pipeline.disable_dual_phase();
             pipeline
                 .configure_demodulator(&trial, sample_rate, frequency_offset_hz + tuning_offset_hz)
                 .ok()?;
@@ -1040,6 +1041,7 @@ fn score_channel_prefix_fll(
         while sample_skip < symbol_span {
             if sample_skip < prefix.len() {
                 if let Ok(mut pipeline) = BitPipeline::<IqSample>::new(&trial) {
+                    pipeline.disable_dual_phase();
                     if pipeline
                         .configure_demodulator(&trial, sample_rate, 0.0)
                         .is_ok()
@@ -1324,6 +1326,28 @@ where
     /// is only as trustworthy as its least reliable parent, so its soft value
     /// is `min(rel[k], rel[k-1])`. Unused when `inner_nrzs` is `None`.
     inner_nrzs_prev_rel: f32,
+    /// Parallel inner Viterbi for the opposite symbol-pairing phase. A
+    /// rate-1/2 convolutional stream can be paired as (s0,s1),(s2,s3),... or
+    /// (s1,s2),(s3,s4),..., and every demodulator re-lock or Gardner timing
+    /// slip can flip which pairing carries the code. The phase-0 decoder above
+    /// only ever tries one pairing, so fragments that land on the other phase
+    /// are lost. This second decoder is fed the same soft stream with its very
+    /// first symbol dropped once (see `phase1_primed`), running an independent
+    /// Viterbi -> NRZ-S -> framer chain. Mirrors gr-satellites' 2x vitfilt27
+    /// topology. `None` unless the downlink is CCSDS concatenated.
+    inner_viterbi_phase1: Option<openhoshimi_codec::StreamingViterbi>,
+    /// NRZ-S decode state for the phase-1 decoder, mirroring [`Self::inner_nrzs`].
+    inner_nrzs_phase1: Option<u8>,
+    /// Phase-1 counterpart of [`Self::inner_nrzs_prev_rel`].
+    inner_nrzs_phase1_prev_rel: f32,
+    /// Independent framer (own ASM-lock state) for the phase-1 decode chain.
+    /// `None` unless the downlink is CCSDS concatenated.
+    framer_phase1: Option<FrameStage>,
+    /// Whether the phase-1 decoder's one-time first-symbol drop has happened.
+    /// The drop offsets its symbol pairing by one relative to phase-0; after
+    /// it fires, the decoder's internal pending-symbol carry keeps the two
+    /// phases interleaved across `push_samples` batches.
+    phase1_primed: bool,
     framer: FrameStage,
     codec: CodecStage,
     total_samples: u64,
@@ -1410,6 +1434,20 @@ where
             Some((_, true)) => Some(0u8),
             _ => None,
         };
+        // Parallel phase-1 decode chain for CCSDS concatenated downlinks: a
+        // second Viterbi + NRZ-S + framer covering the opposite symbol-pairing
+        // phase. Built only when there is an inner Viterbi to pair against.
+        let inner_viterbi_phase1 =
+            ccsds_concat.map(|_| openhoshimi_codec::StreamingViterbi::new());
+        let inner_nrzs_phase1 = match ccsds_concat {
+            Some((_, true)) => Some(0u8),
+            _ => None,
+        };
+        let framer_phase1 = if ccsds_concat.is_some() {
+            Some(build_framer(downlink)?)
+        } else {
+            None
+        };
         Ok(Self {
             demodulator: None,
             line_decoder: build_line_decoder(downlink)?,
@@ -1417,6 +1455,11 @@ where
             inner_viterbi,
             inner_nrzs,
             inner_nrzs_prev_rel: 0.0,
+            inner_viterbi_phase1,
+            inner_nrzs_phase1,
+            inner_nrzs_phase1_prev_rel: 0.0,
+            framer_phase1,
+            phase1_primed: false,
             framer: build_framer(downlink)?,
             codec: build_codec(downlink)?,
             total_samples: 0,
@@ -1425,6 +1468,21 @@ where
             crc_ok: 0,
             crc_fail: 0,
         })
+    }
+
+    /// Disable the parallel phase-1 decode chain, reverting to single-phase.
+    ///
+    /// Blind-acquisition scoring builds throwaway pipelines purely to rank
+    /// candidate offsets/polarities by how much ASM activity they produce.
+    /// The phase-1 chain decodes the opposite symbol pairing, which on a
+    /// wrong candidate is near-random and false-locks the ASM; counting those
+    /// locks would perturb the ranking (and could float a noise cell above a
+    /// real carrier). Scoring therefore runs single-phase, exactly as it did
+    /// before dual-phase existed, so acquisition stays byte-for-byte
+    /// unchanged. Only the live decode pipeline keeps both phases.
+    pub fn disable_dual_phase(&mut self) {
+        self.inner_viterbi_phase1 = None;
+        self.framer_phase1 = None;
     }
 
     /// Feed a chunk of samples into the pipeline.
@@ -1456,12 +1514,18 @@ where
         // low-confidence bytes as erasures on frames the errors-only decode
         // rejects.
         let mut reliabilities: Vec<f32> = Vec::new();
+        // Owned copy of the soft channel symbols, taken before the phase-0
+        // Viterbi reads them so the parallel phase-1 decoder below can replay
+        // the identical stream at the opposite pairing. Stays empty (phase-1
+        // skipped) unless the soft path is taken.
+        let mut ccsds_soft: Vec<i8> = Vec::new();
         if let Some(viterbi) = self.inner_viterbi.as_mut() {
             let soft = demodulator.last_soft_symbols();
             bits = if self.line_decoder.is_none()
                 && self.descrambler.is_none()
                 && soft.len() == bits.len()
             {
+                ccsds_soft = soft.to_vec();
                 let decoded = viterbi.push_soft_symbols(soft);
                 reliabilities = viterbi
                     .last_reliabilities()
@@ -1500,7 +1564,7 @@ where
         // Prefer soft-decision syncword detection when no per-bit transform
         // (line decoder, descrambler, inner Viterbi) sits between the
         // demodulator and the framer.
-        let frames = if self.line_decoder.is_none()
+        let mut frames = if self.line_decoder.is_none()
             && self.descrambler.is_none()
             && self.inner_viterbi.is_none()
         {
@@ -1519,6 +1583,54 @@ where
         } else {
             self.framer.push_bits(&bits)
         };
+
+        // Parallel phase-1 decode: replay the soft stream at the opposite
+        // symbol pairing and merge whatever frames its independent ASM lock
+        // recovers. On a clean pass the phase-0 pairing carries the code
+        // throughout and this wrong-phase decode is near-random -- it never
+        // locks the ASM, so the merged count is unchanged. It only earns its
+        // keep on weak passes, where re-locks and timing slips scatter frame
+        // fragments across both pairings.
+        if let (Some(viterbi1), Some(framer1)) = (
+            self.inner_viterbi_phase1.as_mut(),
+            self.framer_phase1.as_mut(),
+        ) {
+            if !ccsds_soft.is_empty() {
+                let shifted: &[i8] = if self.phase1_primed {
+                    &ccsds_soft
+                } else {
+                    // Drop the very first symbol once to offset the pairing.
+                    self.phase1_primed = true;
+                    &ccsds_soft[1..]
+                };
+                let mut bits1 = viterbi1.push_soft_symbols(shifted);
+                let mut rel1: Vec<f32> = viterbi1
+                    .last_reliabilities()
+                    .iter()
+                    .map(|&r| r as f32)
+                    .collect();
+                if let Some(prev) = self.inner_nrzs_phase1.as_mut() {
+                    let track_rel = rel1.len() == bits1.len();
+                    for (idx, bit) in bits1.iter_mut().enumerate() {
+                        let cur = *bit & 1;
+                        *bit = cur ^ *prev;
+                        *prev = cur;
+                        if track_rel {
+                            let cur_rel = rel1[idx];
+                            rel1[idx] = cur_rel.min(self.inner_nrzs_phase1_prev_rel);
+                            self.inner_nrzs_phase1_prev_rel = cur_rel;
+                        }
+                    }
+                }
+                let frames1 = if rel1.len() == bits1.len() {
+                    framer1.push_bits_with_soft(&bits1, &rel1)
+                } else {
+                    framer1.push_bits(&bits1)
+                };
+                frames.extend(frames1);
+            }
+        }
+
         self.frames_emitted = self.frames_emitted.saturating_add(frames.len() as u64);
         frames
     }
