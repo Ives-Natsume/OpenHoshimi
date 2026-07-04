@@ -896,7 +896,7 @@ impl ComplexFir {
 /// Hamming-windowed sinc low-pass with normalized cutoff `cutoff` cycles per
 /// sample (must be in `(0, 0.5)`). `len` is rounded up to the nearest odd
 /// number internally if needed.
-pub(crate) fn sinc_lowpass_taps(cutoff: f32, len: usize) -> Vec<f32> {
+pub fn sinc_lowpass_taps(cutoff: f32, len: usize) -> Vec<f32> {
     let len = if len % 2 == 0 { len + 1 } else { len };
     let half = (len / 2) as i32;
     let mut taps = Vec::with_capacity(len);

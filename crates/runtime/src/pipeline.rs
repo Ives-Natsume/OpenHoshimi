@@ -17,9 +17,10 @@ use openhoshimi_core::{
     DecodeError, Demodulator, Descrambler, Frame, FrameType, Framing, IqSample, LineDecoder,
 };
 use openhoshimi_dsp::{
-    bin_frequency_hz, fft_in_place, hann_window, Ao40Framer, CcsdsDescrambler, Complex, CpmConfig,
-    CpmDemodulator, CpmMode, FmAudioConfig, FmAudioDemodulator, G3ruhDescrambler, HdlcFramer,
-    LinearConfig, LinearDemodulator, LinearMode, NrziDecoder, SyncwordFramer,
+    bin_frequency_hz, fft_in_place, hann_window, Ao40Framer, CcsdsDescrambler, ChannelFilter,
+    Complex, CpmConfig, CpmDemodulator, CpmMode, FmAudioConfig, FmAudioDemodulator,
+    G3ruhDescrambler, HdlcFramer, LinearConfig, LinearDemodulator, LinearMode, NrziDecoder,
+    SyncwordFramer,
 };
 
 /// Default closed-loop carrier tracker bandwidth for linear IQ demodulation,
@@ -866,6 +867,408 @@ fn push_candidate(candidates: &mut Vec<f32>, candidate: f32) {
         return;
     }
     candidates.push(candidate);
+}
+
+/// Widest usable channel bandwidth for the decimating channel filter, as a
+/// fraction of the post-decimation sample rate. Matches the channel filter's
+/// 0.45-of-Nyquist cutoff (0.45 * 2 = 0.9 of the working rate at full width),
+/// but the retained *signal* band is narrower; we use half of the output rate
+/// as the conservative one-sided channel half-width for grid spacing.
+const CHANNEL_HALF_WIDTH_FRACTION: f32 = 0.45;
+
+/// Coarse offset grid step for the blind frequency sweep, in Hz. Well below the
+/// band-edge FLL's ~±19 kHz pull-in (see the ASRTU-1 modem notes) so adjacent
+/// grid points overlap in capture range and no carrier falls in a gap. The step
+/// is kept tighter than the raw pull-in because the residual left by the grid
+/// must be small enough for the loops to LOCK within the scoring prefix, not
+/// merely be inside the theoretical pull-in: a 15 kHz step bounds the residual
+/// to ±7.5 kHz, which locks fast enough to score decisively.
+const COARSE_SWEEP_STEP_HZ: f32 = 15_000.0;
+
+/// Target samples-per-symbol for the decimated working rate. The linear
+/// demodulator's loops are tuned around ~5 sps (the 50 kHz / 9600 baud ASRTU-1
+/// operating point), so pick the integer decimation that lands closest to it
+/// without going below it (staying at or above 5 sps preserves timing margin).
+const CHANNEL_TARGET_SPS: f32 = 5.0;
+
+/// A resolved decimating-channel + linear-IQ setup produced by the blind
+/// coarse frequency search. The caller derotates the full recording by
+/// `channel_offset_hz`, low-passes, and decimates by `decimation` (yielding
+/// `working_sample_rate`), then runs `setup` at that rate with the reported
+/// residual `setup.tuning_offset_hz` (near zero — the coarse offset already
+/// centred the carrier; the demodulator's own loops close the remainder).
+#[derive(Debug, Clone)]
+pub struct ChannelizedIqSetup {
+    /// Carrier offset shifted to DC by the channel filter, in Hz at the input
+    /// rate.
+    pub channel_offset_hz: f32,
+    /// Integer decimation factor applied by the channel filter.
+    pub decimation: u32,
+    /// Sample rate after decimation, in Hz.
+    pub working_sample_rate: u32,
+    /// Linear-IQ setup (polarity, skip, residual tuning) resolved at the
+    /// decimated working rate.
+    pub setup: LinearIqSetup,
+    /// Number of RS-validated prefix frames the winning candidate produced.
+    pub prefix_frames: usize,
+    /// Number of syncword locks the winning candidate produced in the prefix.
+    /// A strong secondary confidence signal: the true carrier locks the ASM
+    /// repeatedly even before RS confirms a frame.
+    pub prefix_sync_locks: u64,
+}
+
+/// Resolve the integer decimation factor that brings `sample_rate` down to a
+/// working rate near [`CHANNEL_TARGET_SPS`] samples per symbol. Returns 1 when
+/// the input is already at or below the target (no decimation is helpful).
+pub fn resolve_channel_decimation(sample_rate: u32, baudrate: u32) -> u32 {
+    if baudrate == 0 || sample_rate == 0 {
+        return 1;
+    }
+    let sps_in = sample_rate as f32 / baudrate as f32;
+    if sps_in <= CHANNEL_TARGET_SPS * 1.5 {
+        // Already near the sweet spot (e.g. 50 kHz / 9600 = 5.2 sps); leave it.
+        return 1;
+    }
+    let target_rate = CHANNEL_TARGET_SPS * baudrate as f32;
+    // Round the decimation so the working rate stays at or above the target
+    // (>= CHANNEL_TARGET_SPS sps): floor(sps_in / target_sps).
+    let factor = (sample_rate as f32 / target_rate).floor() as u32;
+    factor.max(1)
+}
+
+/// Build the coarse carrier-offset grid for the blind sweep at the input rate.
+///
+/// The grid spans the band the channel filter can reach — the input Nyquist
+/// minus the channel half-width — in [`COARSE_SWEEP_STEP_HZ`] steps, centred on
+/// DC and symmetric about it. The filename-derived tuning hint and the FFT
+/// carrier-peak candidates are prepended so a correctly-labelled recording is
+/// still probed first and exactly.
+fn coarse_sweep_offsets(
+    downlink: &DownlinkDef,
+    sample_rate: u32,
+    prefix: &[IqSample],
+    tuning_offset_hz: f32,
+    decimation: u32,
+) -> Vec<f32> {
+    let mut offsets = Vec::new();
+    // Prefer the labelled/estimated carriers first: on a correctly-tuned
+    // recording these win immediately and the sweep can early-exit.
+    push_candidate(&mut offsets, tuning_offset_hz);
+    for carrier in linear_iq_carrier_candidates(downlink, prefix, sample_rate, 2) {
+        push_candidate(&mut offsets, carrier);
+    }
+
+    // The reachable band: input Nyquist minus the retained channel half-width.
+    let working_rate = sample_rate as f32 / decimation.max(1) as f32;
+    let channel_half_width = working_rate * CHANNEL_HALF_WIDTH_FRACTION;
+    let limit = (sample_rate as f32 / 2.0 - channel_half_width).max(0.0);
+
+    let mut offset = -limit;
+    while offset <= limit + 1.0 {
+        push_candidate(&mut offsets, offset);
+        offset += COARSE_SWEEP_STEP_HZ;
+    }
+    offsets
+}
+
+/// Score a channel-filtered prefix with the demodulator's FLL left ENABLED.
+///
+/// The coarse frequency grid leaves the residual carrier anywhere within the
+/// band-edge FLL's pull-in, so — unlike the fixed-tuning skip/polarity scorer,
+/// which disables the FLL to expose alignment — this scorer keeps the configured
+/// loops running so a candidate is judged by whether it can actually lock. It
+/// sweeps the polarity combinations (with the same CCSDS differential gating as
+/// [`search_linear_iq_alignment_scored`]) and a light integer-skip set, at a
+/// fixed tuning of 0 (the channel filter already centred the carrier).
+fn score_channel_prefix_fll(
+    downlink: &DownlinkDef,
+    sample_rate: u32,
+    prefix: &[IqSample],
+) -> Option<ChannelCandidate> {
+    let ModemDef::Linear {
+        differential,
+        invert,
+        swap_iq,
+        ..
+    } = downlink.modem.as_ref()?
+    else {
+        return None;
+    };
+    let samples_per_symbol = sample_rate as f32 / downlink.baudrate as f32;
+    let symbol_span = samples_per_symbol.round() as usize;
+    if symbol_span == 0 || prefix.len() < symbol_span * 2 {
+        return None;
+    }
+    // A light half-symbol skip sweep is enough: the FLL and timing recovery
+    // settle within the prefix, so exact sub-symbol alignment is not required to
+    // decide whether this offset locks. The full-resolution alignment is left to
+    // the demodulator on the live stream.
+    let skip_step = (symbol_span / 2).max(1);
+
+    let combos: Vec<(bool, bool, bool)> = if codec_handles_differential(downlink) {
+        vec![
+            (*differential, *swap_iq, *invert),
+            (*differential, !*swap_iq, *invert),
+        ]
+    } else {
+        vec![
+            (*differential, *swap_iq, *invert),
+            (*differential, !*swap_iq, *invert),
+            (!*differential, *swap_iq, *invert),
+            (!*differential, !*swap_iq, *invert),
+        ]
+    };
+
+    let per_combo = |&(cand_diff, cand_swap, cand_invert): &(bool, bool, bool)| -> Option<ChannelCandidate> {
+        let mut trial = downlink.clone();
+        if let Some(ModemDef::Linear {
+            differential,
+            invert,
+            swap_iq: trial_swap,
+            ..
+        }) = trial.modem.as_mut()
+        {
+            *differential = cand_diff;
+            *invert = cand_invert;
+            *trial_swap = cand_swap;
+            // NOTE: the FLL bandwidths are intentionally left untouched so the
+            // loop pulls in the residual offset during scoring.
+        }
+        let mut best = ChannelScore::default();
+        let mut best_skip = 0usize;
+        let mut sample_skip = 0usize;
+        while sample_skip < symbol_span {
+            if sample_skip < prefix.len() {
+                if let Ok(mut pipeline) = BitPipeline::<IqSample>::new(&trial) {
+                    if pipeline
+                        .configure_demodulator(&trial, sample_rate, 0.0)
+                        .is_ok()
+                    {
+                        let frames = pipeline.push_samples(&prefix[sample_skip..]);
+                        // push_samples returns framer (ASM-sync) frames, which
+                        // noise can trigger via false ASM matches. Count only
+                        // those that survive the codec: RS-validated and not the
+                        // erasure-forced garbage the pipeline gates
+                        // (decode_frame returns Err for a rejected codeword).
+                        // This is what separates a real lock from a noise offset
+                        // that scrapes a few false syncs.
+                        let validated = frames
+                            .iter()
+                            .filter(|frame| pipeline.decode_frame(frame).is_ok())
+                            .count();
+                        let stats = pipeline.pipeline_stats();
+                        let candidate = ChannelScore {
+                            frames: validated,
+                            sync_locked: stats.sync_locked.unwrap_or(0),
+                            sync_distance: pipeline.best_sync_distance(),
+                        };
+                        if channel_score_better(&best, &candidate) {
+                            best = candidate;
+                            best_skip = sample_skip;
+                        }
+                    }
+                }
+            }
+            sample_skip += skip_step;
+        }
+        if best.frames == 0 && best.sync_locked == 0 && best.sync_distance.is_none() {
+            return None;
+        }
+        Some(ChannelCandidate {
+            hint: IqAlignmentHint {
+                sample_skip: best_skip,
+                differential: cand_diff,
+                invert: cand_invert,
+                swap_iq: cand_swap,
+            },
+            score: best,
+        })
+    };
+
+    combos.par_iter().filter_map(per_combo).reduce_with(|prev, next| {
+        if channel_score_better(&prev.score, &next.score) {
+            next
+        } else {
+            prev
+        }
+    })
+}
+
+/// Discrimination score for a channelized coarse-search candidate.
+///
+/// RS-validated frames are ground truth but sparse on a short prefix, so they
+/// alone cannot separate the true carrier (many frames eventually, many sync
+/// locks immediately) from a noise offset that scrapes one or two false frames.
+/// The syncword lock count is the decisive secondary signal: a correctly-tuned
+/// channel produces a steady train of ASM detections in the Viterbi-decoded
+/// domain long before RS confirms them, whereas noise locks the ASM only
+/// occasionally. Sync distance breaks any remaining tie.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChannelScore {
+    frames: usize,
+    sync_locked: u64,
+    sync_distance: Option<usize>,
+}
+
+/// A scored channelized candidate: the polarity/skip hint plus its score.
+struct ChannelCandidate {
+    hint: IqAlignmentHint,
+    score: ChannelScore,
+}
+
+/// Return true when `candidate` should replace `best`: more frames win; on a
+/// frame tie, more sync locks win; on a further tie, a smaller sync distance
+/// wins.
+fn channel_score_better(best: &ChannelScore, candidate: &ChannelScore) -> bool {
+    match candidate.frames.cmp(&best.frames) {
+        std::cmp::Ordering::Greater => return true,
+        std::cmp::Ordering::Less => return false,
+        std::cmp::Ordering::Equal => {}
+    }
+    match candidate.sync_locked.cmp(&best.sync_locked) {
+        std::cmp::Ordering::Greater => return true,
+        std::cmp::Ordering::Less => return false,
+        std::cmp::Ordering::Equal => {}
+    }
+    match (candidate.sync_distance, best.sync_distance) {
+        (Some(c), Some(b)) => c < b,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Blindly acquire a linear-IQ carrier by sweeping coarse frequency offsets and
+/// scoring each through a decimating channel filter.
+///
+/// For each candidate offset the recording prefix is derotated to DC,
+/// low-passed, and decimated to a working rate near ~5 samples/symbol, then the
+/// real demodulator (FLL enabled, [`score_channel_prefix_fll`]) is run over it.
+/// The candidate that recovers the most RS-validated prefix frames (ties broken
+/// by best sync distance) wins. Returns `None` when the downlink is not linear,
+/// the prefix is too short, or no candidate produced a frame.
+///
+/// This is the general fallback for recordings whose carrier is farther from
+/// the labelled downlink than the band-edge FLL's ±~19 kHz pull-in can reach.
+pub fn blind_linear_iq_channel_setup(
+    downlink: &DownlinkDef,
+    sample_rate: u32,
+    prefix: &[IqSample],
+    tuning_offset_hz: f32,
+) -> Option<ChannelizedIqSetup> {
+    let ModemDef::Linear { .. } = downlink.modem.as_ref()? else {
+        return None;
+    };
+    if sample_rate == 0 || prefix.is_empty() {
+        return None;
+    }
+
+    let decimation = resolve_channel_decimation(sample_rate, downlink.baudrate);
+    let working_sample_rate = sample_rate / decimation.max(1);
+
+    // Diagnostic override: force a specific channel offset (Hz) instead of
+    // sweeping. Lets an operator (or a regression test) point the channel
+    // filter straight at a known carrier and confirm the decimated chain
+    // decodes, isolating the channel filter from the coarse search.
+    let forced_offsets: Option<Vec<f32>> = std::env::var("OPENHOSHIMI_FORCE_CHANNEL_OFFSET")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .map(|hz| vec![hz]);
+    let is_forced = forced_offsets.is_some();
+    let offsets = forced_offsets.unwrap_or_else(|| {
+        coarse_sweep_offsets(downlink, sample_rate, prefix, tuning_offset_hz, decimation)
+    });
+
+    // Score one channel offset: derotate+decimate the prefix, then run the real
+    // demodulator (FLL enabled) over it.
+    //
+    // The FLL must stay ON here, unlike the skip/polarity scorer used at a fixed
+    // tuning: the grid deliberately leaves the residual carrier within the
+    // band-edge FLL's pull-in, so only an FLL-enabled demod reflects whether a
+    // candidate can actually lock. The channel filter already centred the
+    // carrier, so scoring runs at a residual tuning of 0.
+    let score_offset = |offset: f32| -> Option<(f32, ChannelCandidate)> {
+        let mut filter = ChannelFilter::new(sample_rate, offset, decimation);
+        let decimated = filter.push(prefix);
+        let candidate = score_channel_prefix_fll(downlink, working_sample_rate, &decimated);
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "closedhoshimi: coarse offset={offset:+.1} Hz decimated_len={} -> frames={} sync_locked={} sync={:?}",
+            decimated.len(),
+            candidate.as_ref().map_or(0, |c| c.score.frames),
+            candidate.as_ref().map_or(0, |c| c.score.sync_locked),
+            candidate.as_ref().and_then(|c| c.score.sync_distance),
+        );
+        candidate.map(|c| (offset, c))
+    };
+    let pick_best = |a: (f32, ChannelCandidate), b: (f32, ChannelCandidate)| {
+        if channel_score_better(&a.1.score, &b.1.score) {
+            b
+        } else {
+            a
+        }
+    };
+
+    // Coarse pass over the whole grid, then a fine pass in ±one grid step around
+    // the coarse winner. The grid alone can leave a several-kHz residual that
+    // locks too slowly to score decisively; the fine pass drives the residual
+    // toward zero so the true carrier wins cleanly. Skipped when an offset was
+    // forced (diagnostic override) since there is nothing to refine.
+    let mut winner = offsets
+        .par_iter()
+        .filter_map(|&offset| score_offset(offset))
+        .reduce_with(&pick_best)?;
+
+    if !is_forced {
+        const FINE_STEP_HZ: f32 = 5_000.0;
+        let center = winner.0;
+        let fine: Vec<f32> = {
+            let mut v = Vec::new();
+            let mut o = center - COARSE_SWEEP_STEP_HZ + FINE_STEP_HZ;
+            while o < center + COARSE_SWEEP_STEP_HZ {
+                // Skip the coarse point already scored.
+                if (o - center).abs() > 1.0 {
+                    v.push(o);
+                }
+                o += FINE_STEP_HZ;
+            }
+            v
+        };
+        if let Some(fine_winner) = fine
+            .par_iter()
+            .filter_map(|&offset| score_offset(offset))
+            .reduce_with(&pick_best)
+        {
+            winner = pick_best(winner, fine_winner);
+        }
+    }
+
+    let (channel_offset_hz, candidate) = winner;
+    let mut aligned = downlink.clone();
+    if let Some(ModemDef::Linear {
+        differential,
+        invert,
+        swap_iq,
+        ..
+    }) = aligned.modem.as_mut()
+    {
+        *differential = candidate.hint.differential;
+        *invert = candidate.hint.invert;
+        *swap_iq = candidate.hint.swap_iq;
+    }
+    Some(ChannelizedIqSetup {
+        channel_offset_hz,
+        decimation,
+        working_sample_rate,
+        setup: LinearIqSetup {
+            downlink: aligned,
+            // The channel filter absorbed the coarse offset; any residual is
+            // small and closed by the demodulator's own carrier/FLL loops.
+            tuning_offset_hz: 0.0,
+            sample_skip: candidate.hint.sample_skip,
+        },
+        prefix_frames: candidate.score.frames,
+        prefix_sync_locks: candidate.score.sync_locked,
+    })
 }
 
 /// Snapshot of per-stage pipeline counters.

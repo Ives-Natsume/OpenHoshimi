@@ -13,15 +13,16 @@ use openhoshimi_core::satellite::ModemDef;
 use openhoshimi_core::{Frame, InputSource, IoError, IqSample, IqSource};
 use openhoshimi_dsp::estimate_audio_carrier;
 use openhoshimi_dsp::linear::open_symbol_dump;
+use openhoshimi_dsp::ChannelFilter;
 use openhoshimi_io::{
     detect_audio_mode_auto, open_audio_source, read_audio_prefix, read_iq_prefix,
     AudioMode as IoAudioMode, MonoIqSource, WavIqSource,
 };
 use openhoshimi_runtime::pipeline::{
-    estimate_cpm_iq_frequency_offset_hz, estimate_iq_frequency_offset_hz, format_call, format_hex,
-    format_timestamp, frame_type_label, infer_tuning_offset_hz, is_ao40_fec_downlink,
-    prepare_linear_iq_setup_scored, select_downlink, BitPipeline, DecodedFrame, InputKind,
-    SoftAo40Pipeline,
+    blind_linear_iq_channel_setup, estimate_cpm_iq_frequency_offset_hz,
+    estimate_iq_frequency_offset_hz, format_call, format_hex, format_timestamp, frame_type_label,
+    infer_tuning_offset_hz, is_ao40_fec_downlink, prepare_linear_iq_setup_scored, select_downlink,
+    BitPipeline, DecodedFrame, InputKind, SoftAo40Pipeline,
 };
 use openhoshimi_telemetry::SchemaParser;
 
@@ -197,12 +198,14 @@ fn run() -> Result<(), String> {
                         source,
                         pipeline,
                         pending: Vec::new(),
+                        channel: None,
+                        working_sample_rate: sample_rate,
                     }
                 }
                 IoAudioMode::Iq => {
                     let source = WavIqSource::open(&args.input_wav)
                         .map_err(|err| format!("failed to open WAV as IQ: {err}"))?;
-                    build_iq_runner(source, selected.downlink, tuning_offset_hz)?
+                    build_iq_runner(source, &args.input_wav, selected.downlink, tuning_offset_hz)?
                 }
                 IoAudioMode::Auto => unreachable!("IoAudioMode::Auto is resolved above"),
             }
@@ -365,6 +368,16 @@ enum PipelineRunner {
         source: Box<dyn IqSource>,
         pipeline: BitPipeline<IqSample>,
         pending: Vec<IqSample>,
+        /// Decimating channel filter applied to every raw batch before the
+        /// demodulator when the blind coarse search selected a far-offset
+        /// carrier. `None` for the native-rate (filename/near-baseband) path,
+        /// which leaves the sample stream untouched.
+        channel: Option<ChannelFilter>,
+        /// Sample rate the pipeline actually runs at (input rate divided by the
+        /// channel decimation, or the input rate when no channel filter is in
+        /// place). Used to convert the demodulator's sample count to a
+        /// wall-clock timestamp.
+        working_sample_rate: u32,
     },
     IqSoftAo40 {
         source: WavIqSource,
@@ -402,9 +415,11 @@ impl PipelineRunner {
                 pipeline.total_samples() as f64 / source.sample_rate() as f64,
             ),
             Self::Iq {
-                source, pipeline, ..
+                pipeline,
+                working_sample_rate,
+                ..
             } => Duration::from_secs_f64(
-                pipeline.total_samples() as f64 / source.sample_rate() as f64,
+                pipeline.total_samples() as f64 / *working_sample_rate as f64,
             ),
             Self::IqSoftAo40 {
                 source, pipeline, ..
@@ -440,7 +455,13 @@ impl PipelineRunner {
                 source,
                 pipeline,
                 pending,
+                channel,
+                ..
             } => {
+                // The `pending` prefix is already at the working rate (decimated
+                // by the channel filter when one is engaged), so it is pushed
+                // straight through. Freshly-read source batches are raw input
+                // samples and must pass through the channel filter first.
                 if !pending.is_empty() {
                     let take = pending.len().min(READ_CHUNK);
                     let samples: Vec<IqSample> = pending.drain(..take).collect();
@@ -453,7 +474,13 @@ impl PipelineRunner {
                     Err(IoError::EndOfStream) => return Ok(None),
                     Err(err) => return Err(format!("failed to read IQ WAV samples: {err}")),
                 };
-                let frames = pipeline.push_samples(&samples[..read]);
+                let frames = match channel {
+                    Some(filter) => {
+                        let decimated = filter.push(&samples[..read]);
+                        pipeline.push_samples(&decimated)
+                    }
+                    None => pipeline.push_samples(&samples[..read]),
+                };
                 Ok(Some(frames.into_iter().map(BatchEntry::Pending).collect()))
             }
             Self::IqSoftAo40 {
@@ -769,20 +796,84 @@ fn format_float(value: f64) -> String {
     text
 }
 
+/// Seconds of prefix the blind coarse sweep scores. Longer than the native
+/// 8 s window so the FLL/timing loops converge at a coarse-grid residual and
+/// accumulate enough RS-validated frames to out-score noise offsets.
+const BLIND_PREFIX_SECONDS: usize = 30;
+
+/// Read the blind-sweep prefix from a freshly-reopened copy of the input WAV,
+/// leaving the streaming decode source untouched.
+fn read_blind_prefix(input_path: &Path, sample_rate: u32) -> Result<Vec<IqSample>, String> {
+    let mut probe = WavIqSource::open(input_path)
+        .map_err(|err| format!("failed to reopen WAV for blind coarse search: {err}"))?;
+    // Diagnostic: score the blind sweep on a window starting this many seconds
+    // into the pass, not just the start. On passes whose SNR peaks mid-pass the
+    // decodable signal is absent from the first window (frequency x time search).
+    let start_sec = std::env::var("OPENHOSHIMI_BLIND_START_SEC")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let skip = sample_rate as usize * start_sec;
+    let len = sample_rate as usize * BLIND_PREFIX_SECONDS;
+    let all = read_iq_prefix(&mut probe, skip + len)?;
+    Ok(all.into_iter().skip(skip).collect())
+}
+
 /// Build the IQ-mode `PipelineRunner` for a real stereo IQ WAV source.
 ///
 /// Owns the prefix scan, polarity/skew alignment, and CPM carrier
 /// estimation that the IQ path uses to lock onto a recording.
 fn build_iq_runner(
     mut source: WavIqSource,
+    input_path: &Path,
     downlink_in: &openhoshimi_core::satellite::DownlinkDef,
     tuning_offset_hz: f32,
 ) -> Result<PipelineRunner, String> {
     let sample_rate = source.sample_rate();
+    // Native scan: the established 8 s prefix, read from the streaming source —
+    // its behaviour on already-working recordings stays byte-for-byte unchanged.
     let prefix_len = sample_rate as usize * 8;
     let prefix = read_iq_prefix(&mut source, prefix_len)?;
     let scored =
         prepare_linear_iq_setup_scored(downlink_in, sample_rate, &prefix, tuning_offset_hz);
+    let native_frames = scored.as_ref().map_or(0, |(_, frames)| *frames);
+
+    // Blind coarse frequency acquisition: sweep candidate carrier offsets across
+    // the whole recording band through a decimating channel filter, scoring each
+    // by RS-validated prefix frames. This isolates a single narrow channel —
+    // rejecting the other in-band signals that otherwise dominate the AGC/loops
+    // — and runs the demodulator at ~5 samples/symbol.
+    //
+    // The sweep reads its own longer prefix from a freshly-reopened source so it
+    // does not disturb the streaming `source` used for decode. It needs the
+    // longer look to let the FLL/timing loops converge at a coarse residual and
+    // accumulate enough RS-validated frames to out-score noise.
+    //
+    // The native scan already tries the filename tuning, the FFT carrier peaks,
+    // and the average offset within the band-edge FLL's pull-in, so it is kept
+    // whenever it decodes. The blind result is adopted only when it decimates a
+    // wideband recording (decimation > 1 — a rate the native chain leaves
+    // unfiltered at ~26 sps) AND recovers strictly more RS-validated prefix
+    // frames than the native scan. At decimation == 1 (the 50 kHz ASRTU
+    // recording) the blind chain is functionally the native chain, so it is not
+    // allowed to override a working native decode. AO-40 FEC keeps its dedicated
+    // soft path. A diagnostic env override forces the channel path.
+    let force_channel = std::env::var_os("OPENHOSHIMI_FORCE_CHANNEL_OFFSET").is_some();
+    if !is_ao40_fec_downlink(downlink_in) {
+        let blind_prefix = read_blind_prefix(input_path, sample_rate)?;
+        if let Some(channelized) =
+            blind_linear_iq_channel_setup(downlink_in, sample_rate, &blind_prefix, tuning_offset_hz)
+        {
+            let adopt = channelized.decimation > 1 && channelized.prefix_frames > native_frames;
+            if force_channel || adopt {
+                // The channelized runner re-derives its own prefix from the raw
+                // stream `source` (already positioned past the native 8 s
+                // prefix), so `prefix` here is only the native window.
+                return build_channelized_iq_runner(source, prefix, sample_rate, channelized);
+            }
+        }
+    }
+
     let setup = scored.as_ref().map(|(setup, _)| setup.clone());
     let (downlink, tuning_offset_hz, pending) = if let Some(setup) = setup {
         let pending = if setup.sample_skip < prefix.len() {
@@ -839,6 +930,73 @@ fn build_iq_runner(
             source: Box::new(source),
             pipeline,
             pending,
+            channel: None,
+            working_sample_rate: sample_rate,
         })
     }
+}
+
+/// Build the IQ runner for a carrier acquired by the blind coarse frequency
+/// search. Installs a decimating channel filter that shifts the chosen offset
+/// to DC and drops the sample rate to the working rate, then runs the linear
+/// pipeline on the decimated stream. The prefix already read from the source is
+/// decimated once here so it is not re-read.
+fn build_channelized_iq_runner(
+    source: WavIqSource,
+    prefix: Vec<IqSample>,
+    input_sample_rate: u32,
+    channelized: openhoshimi_runtime::pipeline::ChannelizedIqSetup,
+) -> Result<PipelineRunner, String> {
+    let openhoshimi_runtime::pipeline::ChannelizedIqSetup {
+        channel_offset_hz,
+        decimation,
+        working_sample_rate,
+        setup,
+        prefix_frames,
+        prefix_sync_locks,
+    } = channelized;
+
+    eprintln!(
+        "decode_file: blind coarse acquisition: offset={channel_offset_hz:+.1} Hz decimation={decimation} working_rate={working_sample_rate} Hz prefix_frames={prefix_frames} prefix_sync_locks={prefix_sync_locks}",
+    );
+    if let Some(ModemDef::Linear {
+        differential,
+        invert,
+        swap_iq,
+        ..
+    }) = setup.downlink.modem.as_ref()
+    {
+        eprintln!(
+            "decode_file: blind polarity: differential={differential} invert={invert} swap_iq={swap_iq}",
+        );
+    }
+
+    // Decimate the already-read prefix through a filter identical to the one
+    // that will process the live stream, then drop the resolved sample skip in
+    // the decimated domain so demodulation starts at the best symbol boundary.
+    let mut prefix_filter = ChannelFilter::new(input_sample_rate, channel_offset_hz, decimation);
+    let decimated_prefix = prefix_filter.push(&prefix);
+    let pending: Vec<IqSample> = if setup.sample_skip < decimated_prefix.len() {
+        decimated_prefix.into_iter().skip(setup.sample_skip).collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut pipeline = BitPipeline::<IqSample>::new(&setup.downlink)?;
+    pipeline.configure_demodulator(&setup.downlink, working_sample_rate, setup.tuning_offset_hz)?;
+
+    // The live-stream channel filter is a fresh instance: its NCO/FIR/decimation
+    // phase must start from the sample right after the prefix. The source has
+    // already advanced past the prefix (read_iq_prefix consumed it), and the
+    // decimation cadence realigns within a few output samples, so a fresh
+    // filter is correct here.
+    let channel = ChannelFilter::new(input_sample_rate, channel_offset_hz, decimation);
+
+    Ok(PipelineRunner::Iq {
+        source: Box::new(source),
+        pipeline,
+        pending,
+        channel: Some(channel),
+        working_sample_rate,
+    })
 }
