@@ -718,6 +718,32 @@ impl GardnerTracker {
         self.prev_input = primary;
         self.prev_input_aux = aux;
         self.cursor += 1.0;
+
+        // `cursor` and the `next_*` schedules accumulate unbounded over the
+        // whole stream. In f32 they lose integer resolution past 2^24 samples
+        // (~67 s at 250 kHz): `cursor += 1.0` stops advancing entirely and the
+        // timing loop freezes, silently truncating a long recording. Rebase by
+        // a whole-sample offset once the cursor grows large. Subtracting the
+        // same integer from `cursor`, `next_symbol` and `next_mid` leaves every
+        // comparison and interpolation fraction unchanged -- they depend only
+        // on the differences -- while keeping the values small and precise.
+        //
+        // The threshold (2^23) sits above the sample count any single ~90 s
+        // 50 kHz recording reaches, so those runs never rebase and decode
+        // bit-for-bit as before; only longer/higher-rate streams (e.g. the
+        // 250 kHz weak pass) cross it, and they rebase well before the 2^24
+        // freeze. `next_mid` is left alone while it holds its consumed-marker
+        // `INFINITY` sentinel.
+        const REBASE_THRESHOLD: f32 = 8_388_608.0; // 2^23
+        if self.cursor >= REBASE_THRESHOLD {
+            let shift = self.cursor - 1.0;
+            self.cursor -= shift;
+            self.next_symbol -= shift;
+            if self.next_mid.is_finite() {
+                self.next_mid -= shift;
+            }
+        }
+
         emitted
     }
 }
@@ -1238,5 +1264,41 @@ mod tests {
             best = best.min(errors.min(tail - errors));
         }
         assert_eq!(best, 0, "gardner did not lock: tail errors {best}");
+    }
+
+    #[test]
+    fn gardner_survives_past_the_f32_freeze_point() {
+        // Regression guard for the f32 cursor freeze. Past 2^24 input samples
+        // the old f32 schedule stopped advancing (`cursor += 1.0` became a
+        // no-op) and the loop emitted no more symbols, silently truncating any
+        // stream longer than ~67 s at 250 kHz. The rebase must keep symbols
+        // coming at the steady ~1/sps rate all the way through a stream that
+        // runs past 2^24. The emission schedule is signal-independent, so a
+        // cheap square wave is enough.
+        let sps = 5.0f32;
+        let mut tracker = GardnerTracker::new(sps);
+        let total: u64 = (1u64 << 24) + 500_000;
+        let tail_start = total - 200_000;
+        let mut emitted_total: u64 = 0;
+        let mut emitted_tail: u64 = 0;
+        for n in 0..total {
+            let sample = if (n / 3) % 2 == 0 { 1.0 } else { -1.0 };
+            if tracker.push(sample).is_some() {
+                emitted_total += 1;
+                if n >= tail_start {
+                    emitted_tail += 1;
+                }
+            }
+        }
+        // Without the fix, emission stops at 2^24: the total falls ~20 % short
+        // and the tail window (entirely past 2^24) yields nothing.
+        assert!(
+            emitted_total > (total as f64 / f64::from(sps) * 0.9) as u64,
+            "too few symbols overall: {emitted_total}"
+        );
+        assert!(
+            emitted_tail > 30_000,
+            "timing loop froze past 2^24: only {emitted_tail} symbols in the tail window"
+        );
     }
 }
