@@ -142,11 +142,20 @@ impl LinearConfig {
 #[derive(Debug, Clone)]
 pub struct LinearDemodulator {
     config: LinearConfig,
-    nominal_samples_per_symbol: f32,
     carrier_phase: f32,
     carrier_increment: f32,
-    nco_increment: f32,
     nco_fll_offset: f32,
+    /// Costas phase accumulator, applied AFTER symbol-timing recovery, once
+    /// per recovered symbol. The pre-timing `correct_frequency` derotates only
+    /// by the static carrier increment and the Kay FLL offset, leaving the
+    /// constellation still spinning at the residual phase; the Gardner TED is
+    /// rotation invariant so timing locks on that spinning stream. This
+    /// accumulator then pulls each recovered symbol back onto the in-phase
+    /// axis, matching the official topology (timing first, Costas second) used
+    /// by both gr-satellites' GRC flow and the in-house soundmodem decoder.
+    costas_phase: f32,
+    /// Costas NCO frequency (integral term), advanced once per symbol.
+    costas_freq: f32,
     nco_limit_radians: f32,
     loop_alpha: f32,
     loop_beta: f32,
@@ -262,9 +271,9 @@ impl LinearDemodulator {
         };
         let buffer_len = matched_taps.as_ref().map_or(0, Vec::len);
         Ok(Self {
-            nominal_samples_per_symbol: samples_per_symbol,
             carrier_increment: -TAU * config.frequency_offset_hz / config.sample_rate as f32,
-            nco_increment: 0.0,
+            costas_phase: 0.0,
+            costas_freq: 0.0,
             nco_fll_offset: 0.0,
             nco_limit_radians,
             loop_alpha,
@@ -501,7 +510,12 @@ impl LinearDemodulator {
         let phase = self.carrier_phase;
         let sin = phase.sin();
         let cos = phase.cos();
-        self.carrier_phase += self.carrier_increment + self.nco_increment + self.nco_fll_offset;
+        // Pre-timing frequency correction only: the static carrier increment
+        // plus the Kay FLL offset. The Costas PHASE loop no longer contributes
+        // here -- it moved after timing recovery (see `costas_derotate`), so
+        // the Gardner loop runs on a frequency-corrected but still phase-
+        // rotating stream and its rotation-invariant TED locks the clock there.
+        self.carrier_phase += self.carrier_increment + self.nco_fll_offset;
         if self.carrier_phase >= TAU || self.carrier_phase <= -TAU {
             self.carrier_phase %= TAU;
         }
@@ -512,53 +526,85 @@ impl LinearDemodulator {
         }
     }
 
-    fn update_carrier_tracker(&mut self, current: IqSample) {
-        if self.loop_alpha == 0.0 && self.loop_beta == 0.0 && self.freq_loop_alpha == 0.0 {
+    /// Kay-style squared-symbol FLL, measured on the PRE-Costas recovered
+    /// symbol (the still-rotating constellation straight out of the Gardner
+    /// loop). It feeds `nco_fll_offset` back into the per-sample
+    /// `correct_frequency` ahead of timing, so the wide Doppler pull-in stays
+    /// in front of the symbol clock exactly as before; only the measurement
+    /// point moved from post- to pre-Costas, which is fine because the
+    /// squaring nonlinearity removes the BPSK phase anyway.
+    ///
+    /// Dropping this loop collapses ASRTU-1 decode to zero (the band-edge FLL
+    /// alone leaves too much residual Doppler for the timing loop), so it is
+    /// kept verbatim; only the Costas PHASE loop relocated after timing.
+    fn update_fll(&mut self, symbol: IqSample) {
+        if self.freq_loop_alpha <= 0.0 {
             return;
         }
-
-        let magnitude_squared = current.i.mul_add(current.i, current.q * current.q);
+        let magnitude_squared = symbol.i.mul_add(symbol.i, symbol.q * symbol.q);
         if magnitude_squared <= f32::EPSILON {
             return;
         }
         let scale = magnitude_squared.sqrt();
+        let i = symbol.i / scale;
+        let q = symbol.q / scale;
+
+        // imag(s²_n * conj(s²_{n-1})) collapses BPSK 180° flips so the
+        // discriminator sees only the residual carrier rotation. Leaky
+        // integrator keeps the FLL from sticking at the clamp during fades.
+        let s2 = IqSample {
+            i: i * i - q * q,
+            q: 2.0 * i * q,
+        };
+        if let Some(prev) = self.fll_prev_squared {
+            let mag_curr_sq = s2.i.mul_add(s2.i, s2.q * s2.q);
+            let mag_prev_sq = prev.i.mul_add(prev.i, prev.q * prev.q);
+            let denom = (mag_curr_sq * mag_prev_sq).sqrt();
+            if denom > f32::EPSILON {
+                let cross = s2.q * prev.i - s2.i * prev.q;
+                let fll_error = (cross / denom).clamp(-1.0, 1.0);
+                let leak = self.freq_loop_alpha;
+                // Same `+carrier_phase` de-rotation convention: SUBTRACT the
+                // discriminator, otherwise the FLL runs to the wrong NCO rail.
+                self.nco_fll_offset =
+                    (1.0 - leak) * self.nco_fll_offset - self.freq_loop_alpha * fll_error;
+                self.nco_fll_offset = self
+                    .nco_fll_offset
+                    .clamp(-self.nco_limit_radians, self.nco_limit_radians);
+            }
+        }
+        self.fll_prev_squared = Some(s2);
+    }
+
+    /// Costas phase loop, run ONCE PER RECOVERED SYMBOL after timing recovery.
+    /// Derotates the pre-Costas symbol by the current `costas_phase`, forms the
+    /// decision-directed error, advances the PI loop, and returns the
+    /// derotated symbol used for slicing. This is the official topology
+    /// (timing first, Costas second) and matches the in-house soundmodem
+    /// decoder, whose Costas also updates per symbol.
+    fn costas_derotate(&mut self, pre: IqSample) -> IqSample {
+        if self.loop_alpha == 0.0 && self.loop_beta == 0.0 {
+            return pre;
+        }
+
+        // Derotate by `+costas_phase`, the same rotation sense as
+        // `correct_frequency`, so a symbol sitting at residual angle `+theta`
+        // is pulled toward the in-phase axis when the loop drives
+        // `costas_phase` toward `-theta`.
+        let sin = self.costas_phase.sin();
+        let cos = self.costas_phase.cos();
+        let current = IqSample {
+            i: pre.i * cos - pre.q * sin,
+            q: pre.i * sin + pre.q * cos,
+        };
+
+        let magnitude_squared = current.i.mul_add(current.i, current.q * current.q);
+        if magnitude_squared <= f32::EPSILON {
+            return current;
+        }
+        let scale = magnitude_squared.sqrt();
         let i = current.i / scale;
         let q = current.q / scale;
-
-        // Kay-style FLL on squared symbols: imag(s²_n * conj(s²_{n-1}))
-        // collapses BPSK 180° flips so the discriminator sees only the
-        // residual carrier rotation, giving wide pull-in over Doppler before
-        // the phase-locked Costas tracker converges. The FLL state is kept
-        // separate from the Costas integrator (`nco_increment`) and decays
-        // via a leaky integrator: the discriminator on noisy squared symbols
-        // is shared with Costas through the NCO sum but does not perturb the
-        // Costas beta accumulator, and the leak keeps the FLL from sticking
-        // at the clamp during fades.
-        if self.freq_loop_alpha > 0.0 {
-            let s2 = IqSample {
-                i: i * i - q * q,
-                q: 2.0 * i * q,
-            };
-            if let Some(prev) = self.fll_prev_squared {
-                let mag_curr_sq = s2.i.mul_add(s2.i, s2.q * s2.q);
-                let mag_prev_sq = prev.i.mul_add(prev.i, prev.q * prev.q);
-                let denom = (mag_curr_sq * mag_prev_sq).sqrt();
-                if denom > f32::EPSILON {
-                    let cross = s2.q * prev.i - s2.i * prev.q;
-                    let fll_error = (cross / denom).clamp(-1.0, 1.0);
-                    let leak = self.freq_loop_alpha;
-                    // Same `+carrier_phase` de-rotation convention as the Costas
-                    // terms: the discriminator must be SUBTRACTED, otherwise the
-                    // FLL runs to the wrong NCO rail.
-                    self.nco_fll_offset =
-                        (1.0 - leak) * self.nco_fll_offset - self.freq_loop_alpha * fll_error;
-                    self.nco_fll_offset = self
-                        .nco_fll_offset
-                        .clamp(-self.nco_limit_radians, self.nco_limit_radians);
-                }
-            }
-            self.fll_prev_squared = Some(s2);
-        }
 
         let error = match self.config.mode {
             LinearMode::Bpsk | LinearMode::Dbpsk => i * q,
@@ -568,34 +614,26 @@ impl LinearDemodulator {
                 sign_i * q - sign_q * i
             }
         };
-        // Sign convention: `correct_frequency` de-rotates each sample by
-        // `+carrier_phase`, so to pull a symbol sitting at residual angle `+theta`
-        // back onto the in-phase axis the loop must drive `carrier_phase` toward
-        // `-theta`. The Costas detector `i*q` is positive for `+theta`, so both PI
-        // terms must SUBTRACT it; negating `error` once here flips both
-        // consistently. (Adding it is positive feedback that locks onto the
-        // quadrature axis instead. This path is only active when
-        // `carrier_loop_bandwidth > 0`, which no unit test exercised.)
+        // Detector `i*q` is positive for a `+theta` residual; both PI terms
+        // must SUBTRACT it to pull the constellation back to I (adding it is
+        // positive feedback onto the quadrature axis). Negating once flips both
+        // consistently.
         let error = -error.clamp(-1.0, 1.0);
 
-        // The Costas detector and both PI terms are updated once per symbol,
-        // but `nco_increment` is a per-sample phase advance: `correct_frequency`
-        // adds it on every one of the `samples_per_symbol` samples in a symbol.
-        // The integral term must therefore be scaled by 1/samples_per_symbol so
-        // its per-symbol phase contribution changes by `loop_beta * error` (the
-        // designed amount) instead of `loop_beta * error * samples_per_symbol`.
-        // Without this the realized damping ratio collapses by sqrt(sps) (~6.3x
-        // at 40 sps), leaving the loop badly under-damped: it limps on constant
-        // offsets but cannot track Doppler drift, and widening the bandwidth
-        // only drives it into instability.
-        self.nco_increment += self.loop_beta * error / self.nominal_samples_per_symbol;
-        self.nco_increment = self
-            .nco_increment
+        // Per-symbol update: unlike the old per-sample Costas there is no
+        // 1/samples_per_symbol scaling on the integral term, because the loop
+        // now advances exactly once per symbol -- the rate `loop_beta` and
+        // `loop_alpha` were designed for.
+        self.costas_freq += self.loop_beta * error;
+        self.costas_freq = self
+            .costas_freq
             .clamp(-self.nco_limit_radians, self.nco_limit_radians);
-        self.carrier_phase += self.loop_alpha * error;
-        if self.carrier_phase >= TAU || self.carrier_phase <= -TAU {
-            self.carrier_phase %= TAU;
+        self.costas_phase += self.costas_freq + self.loop_alpha * error;
+        if self.costas_phase >= TAU || self.costas_phase <= -TAU {
+            self.costas_phase %= TAU;
         }
+
+        current
     }
 
     fn matched_filter(&mut self, sample: IqSample) -> IqSample {
@@ -659,8 +697,12 @@ impl LinearDemodulator {
             // Q at the identical recovered instant; a decision fires only when
             // the loop reaches a symbol time, not on a fixed sample count.
             if let Some((i, q)) = self.timing.push_dual(filtered.i, filtered.q) {
-                let current = IqSample { i, q };
-                self.update_carrier_tracker(current);
+                let pre = IqSample { i, q };
+                // Kay FLL is measured on the pre-Costas (still-rotating) symbol
+                // and feeds `correct_frequency` ahead of timing; the Costas
+                // phase loop then pulls this symbol onto the in-phase axis.
+                self.update_fll(pre);
+                let current = self.costas_derotate(pre);
                 write_symbol_dump(current);
                 soft_bits.extend_from_slice(&self.slice_symbol_soft(current));
             }
@@ -691,8 +733,12 @@ impl Demodulator for LinearDemodulator {
             // Q at the identical recovered instant; a decision fires only when
             // the loop reaches a symbol time, not on a fixed sample count.
             if let Some((i, q)) = self.timing.push_dual(filtered.i, filtered.q) {
-                let current = IqSample { i, q };
-                self.update_carrier_tracker(current);
+                let pre = IqSample { i, q };
+                // Kay FLL is measured on the pre-Costas (still-rotating) symbol
+                // and feeds `correct_frequency` ahead of timing; the Costas
+                // phase loop then pulls this symbol onto the in-phase axis.
+                self.update_fll(pre);
+                let current = self.costas_derotate(pre);
                 write_symbol_dump(current);
                 if matches!(self.config.mode, LinearMode::Bpsk | LinearMode::Dbpsk) {
                     // Binary modes also produce a sign-aligned soft value so a
@@ -967,7 +1013,7 @@ mod tests {
     #[test]
     fn carrier_loop_acquires_uncorrected_offset() {
         // Regression guard for the Costas carrier loop. Every other test
-        // leaves `carrier_loop_bandwidth = 0`, so `update_carrier_tracker`
+        // leaves `carrier_loop_bandwidth = 0`, so `costas_derotate`
         // short-circuits and the loop never runs -- which is how a
         // positive-feedback sign error and a per-symbol/per-sample integral
         // mis-scaling both shipped while 56 tests passed. Here we force the
@@ -1053,13 +1099,24 @@ mod tests {
 
     #[test]
     fn recovers_qpsk_symbols_as_iq_bit_pairs() {
-        let symbols = [
+        // Each quadrant maps to a fixed 2-bit pair; check that both axes are
+        // sliced together at the recovered symbol instant. The Gardner timing
+        // loop's TED is now rotation invariant (it consumes both I and Q), so
+        // like the other timing-sensitive tests in this module the stream is
+        // repeated long enough to clear the loop's cold-start warm-up and the
+        // settled tail is what gets asserted, rather than a 3-symbol toy burst
+        // where the last decision straddles the end-of-stream boundary.
+        let pattern = [
             IqSample { i: 1.0, q: 1.0 },
             IqSample { i: -1.0, q: 1.0 },
             IqSample { i: -1.0, q: -1.0 },
+            IqSample { i: 1.0, q: -1.0 },
         ];
-        let samples = repeat_symbols(&symbols, 2);
-        let config = LinearConfig::new(2_400, 1_200, LinearMode::Qpsk);
+        // slice_quadrature maps each axis independently: bit = (axis >= 0).
+        let expected_pairs = [[1u8, 1], [0, 1], [0, 0], [1, 0]];
+        let symbols: Vec<IqSample> = (0..40).flat_map(|_| pattern).collect();
+        let samples = repeat_symbols(&symbols, 4);
+        let config = LinearConfig::new(4_800, 1_200, LinearMode::Qpsk);
         let mut demodulator = match LinearDemodulator::new(config) {
             Ok(demodulator) => demodulator,
             Err(err) => panic!("valid config: {err}"),
@@ -1067,7 +1124,29 @@ mod tests {
 
         let recovered = demodulator.push_samples(&samples);
 
-        assert_eq!(recovered, vec![1, 1, 0, 1, 0, 0]);
+        // Skip the warm-up, then every emitted bit pair must match the fixed
+        // quadrant mapping of the repeating pattern. Align the settled tail to
+        // a pattern boundary so the 4-symbol cycle indexes cleanly.
+        let skip_pairs = 20usize;
+        let pairs: Vec<&[u8]> = recovered.chunks(2).skip(skip_pairs).collect();
+        assert!(pairs.len() > 40, "too few QPSK pairs recovered: {}", pairs.len());
+        // Find the phase of the first settled pair within the 4-symbol cycle.
+        let phase = (0..4)
+            .find(|&p| {
+                pairs
+                    .iter()
+                    .take(4)
+                    .enumerate()
+                    .all(|(k, pair)| pair == &expected_pairs[(p + k) % 4])
+            })
+            .expect("settled QPSK pairs do not match any cycle phase");
+        for (k, pair) in pairs.iter().enumerate() {
+            assert_eq!(
+                *pair,
+                &expected_pairs[(phase + k) % 4],
+                "QPSK pair {k} mismatch"
+            );
+        }
     }
 
     #[test]

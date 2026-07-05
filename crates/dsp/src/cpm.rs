@@ -524,12 +524,16 @@ pub(crate) struct GardnerTracker {
     /// Sample index of the next mid-symbol sample (fractional).
     next_mid: f32,
     /// Symbol-instant value of the previous symbol, the left endpoint of
-    /// the Gardner slope `y[n] - y[n-1]`.
+    /// the Gardner slope `y[n] - y[n-1]`. Both axes are kept so the TED can be
+    /// evaluated as the rotation-invariant `Re{conj(y_mid) * (y[n]-y[n-1])}`,
+    /// which stays valid when the carrier phase is not yet removed (i.e. when
+    /// timing runs ahead of the Costas loop).
     prev_symbol: f32,
-    /// Mid-symbol sample captured but not yet consumed by the current
-    /// symbol-time update. `None` between symbols. This is the sample
+    prev_symbol_aux: f32,
+    /// Mid-symbol complex sample `(i, q)` captured but not yet consumed by the
+    /// current symbol-time update. `None` between symbols. This is the sample
     /// halfway between the previous and current symbol instants.
-    mid_pending: Option<f32>,
+    mid_pending: Option<(f32, f32)>,
     /// True once we have a previous symbol value, so the Gardner slope is
     /// meaningful and a TED update can be generated.
     have_prev_symbol: bool,
@@ -613,6 +617,7 @@ impl GardnerTracker {
             next_symbol: samples_per_symbol * 0.5,
             next_mid: samples_per_symbol,
             prev_symbol: 0.0,
+            prev_symbol_aux: 0.0,
             mid_pending: None,
             have_prev_symbol: false,
             cursor: 0.0,
@@ -670,11 +675,14 @@ impl GardnerTracker {
         // than the symbol-time value used in the same Gardner update. With
         // the schedule `next_mid = next_symbol - T/2`, the mid event always
         // comes before the symbol event in the stream, so this ordering is
-        // correct. The TED only needs the primary channel, so the mid sample
-        // is interpolated on `primary` alone.
+        // correct. Both axes are interpolated so the rotation-invariant TED
+        // below can use the quadrature component.
         if self.cursor >= self.next_mid {
             let frac = (self.next_mid - (self.cursor - 1.0)).clamp(0.0, 1.0);
-            self.mid_pending = Some(lerp(self.prev_input, primary, frac));
+            self.mid_pending = Some((
+                lerp(self.prev_input, primary, frac),
+                lerp(self.prev_input_aux, aux, frac),
+            ));
             self.next_mid = f32::INFINITY;
         }
 
@@ -686,21 +694,27 @@ impl GardnerTracker {
             // sampled at the identical recovered instant as the primary.
             let symbol_aux = lerp(self.prev_input_aux, aux, frac);
 
-            if let Some(mid) = self.mid_pending.take() {
+            if let Some((mid_i, mid_q)) = self.mid_pending.take() {
                 if self.have_prev_symbol {
-                    // Classic Gardner TED: e = y_mid * (y[n] - y[n-1]), where
-                    // y_mid is the sample halfway between the previous and
-                    // current symbol instants and y[n], y[n-1] are the
-                    // symbol-instant samples. The mid sample scaled by the
-                    // slope across the decision instant is zero on average
-                    // when the clock is centred; it is decision-free, so it
-                    // works even when individual BPSK decisions are wrong.
+                    // Rotation-invariant Gardner TED:
+                    //   e = Re{ conj(y_mid) * (y[n] - y[n-1]) }
+                    //     = mid_i*(sym_i - prev_i) + mid_q*(sym_q - prev_q).
+                    // The classic scalar form uses only the in-phase term,
+                    // which requires the constellation to already sit on I --
+                    // i.e. the Costas loop must run BEFORE timing. Summing the
+                    // quadrature term makes the detector invariant to an
+                    // un-removed carrier phase, so timing can run on the
+                    // still-rotating stream and the Costas loop can follow it.
+                    // On the Costas-first path q ~= 0, so this reduces to the
+                    // scalar TED. The mid sample scaled by the slope across the
+                    // decision instant averages to zero when the clock is
+                    // centred; it is decision-free, so it works even when
+                    // individual BPSK decisions are wrong.
                     //
-                    // Sign: a POSITIVE error means the sampler is LATE, so
-                    // the period must shorten to advance the next instant.
-                    // gr-satellites' loop filter (gr-digital `control_loop`)
-                    // subtracts the error from the period for this reason.
-                    let error = mid * (symbol - self.prev_symbol);
+                    // Sign: a POSITIVE error means the sampler is LATE, so the
+                    // period must shorten to advance the next instant.
+                    let error = mid_i * (symbol - self.prev_symbol)
+                        + mid_q * (symbol_aux - self.prev_symbol_aux);
                     self.period_avg = (self.period_avg - self.beta * error)
                         .clamp(self.period_min, self.period_max);
                     self.period = (self.period_avg - self.alpha * error)
@@ -708,6 +722,7 @@ impl GardnerTracker {
                 }
             }
             self.prev_symbol = symbol;
+            self.prev_symbol_aux = symbol_aux;
             self.have_prev_symbol = true;
 
             self.next_symbol += self.period;
