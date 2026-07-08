@@ -1020,80 +1020,84 @@ fn score_channel_prefix_fll(
         ]
     };
 
-    let per_combo = |&(cand_diff, cand_swap, cand_invert): &(bool, bool, bool)| -> Option<ChannelCandidate> {
-        let mut trial = downlink.clone();
-        if let Some(ModemDef::Linear {
-            differential,
-            invert,
-            swap_iq: trial_swap,
-            ..
-        }) = trial.modem.as_mut()
-        {
-            *differential = cand_diff;
-            *invert = cand_invert;
-            *trial_swap = cand_swap;
-            // NOTE: the FLL bandwidths are intentionally left untouched so the
-            // loop pulls in the residual offset during scoring.
-        }
-        let mut best = ChannelScore::default();
-        let mut best_skip = 0usize;
-        let mut sample_skip = 0usize;
-        while sample_skip < symbol_span {
-            if sample_skip < prefix.len() {
-                if let Ok(mut pipeline) = BitPipeline::<IqSample>::new(&trial) {
-                    pipeline.disable_dual_phase();
-                    if pipeline
-                        .configure_demodulator(&trial, sample_rate, 0.0)
-                        .is_ok()
-                    {
-                        let frames = pipeline.push_samples(&prefix[sample_skip..]);
-                        // push_samples returns framer (ASM-sync) frames, which
-                        // noise can trigger via false ASM matches. Count only
-                        // those that survive the codec: RS-validated and not the
-                        // erasure-forced garbage the pipeline gates
-                        // (decode_frame returns Err for a rejected codeword).
-                        // This is what separates a real lock from a noise offset
-                        // that scrapes a few false syncs.
-                        let validated = frames
-                            .iter()
-                            .filter(|frame| pipeline.decode_frame(frame).is_ok())
-                            .count();
-                        let stats = pipeline.pipeline_stats();
-                        let candidate = ChannelScore {
-                            frames: validated,
-                            sync_locked: stats.sync_locked.unwrap_or(0),
-                            sync_distance: pipeline.best_sync_distance(),
-                        };
-                        if channel_score_better(&best, &candidate) {
-                            best = candidate;
-                            best_skip = sample_skip;
+    let per_combo =
+        |&(cand_diff, cand_swap, cand_invert): &(bool, bool, bool)| -> Option<ChannelCandidate> {
+            let mut trial = downlink.clone();
+            if let Some(ModemDef::Linear {
+                differential,
+                invert,
+                swap_iq: trial_swap,
+                ..
+            }) = trial.modem.as_mut()
+            {
+                *differential = cand_diff;
+                *invert = cand_invert;
+                *trial_swap = cand_swap;
+                // NOTE: the FLL bandwidths are intentionally left untouched so the
+                // loop pulls in the residual offset during scoring.
+            }
+            let mut best = ChannelScore::default();
+            let mut best_skip = 0usize;
+            let mut sample_skip = 0usize;
+            while sample_skip < symbol_span {
+                if sample_skip < prefix.len() {
+                    if let Ok(mut pipeline) = BitPipeline::<IqSample>::new(&trial) {
+                        pipeline.disable_dual_phase();
+                        if pipeline
+                            .configure_demodulator(&trial, sample_rate, 0.0)
+                            .is_ok()
+                        {
+                            let frames = pipeline.push_samples(&prefix[sample_skip..]);
+                            // push_samples returns framer (ASM-sync) frames, which
+                            // noise can trigger via false ASM matches. Count only
+                            // those that survive the codec: RS-validated and not the
+                            // erasure-forced garbage the pipeline gates
+                            // (decode_frame returns Err for a rejected codeword).
+                            // This is what separates a real lock from a noise offset
+                            // that scrapes a few false syncs.
+                            let validated = frames
+                                .iter()
+                                .filter(|frame| pipeline.decode_frame(frame).is_ok())
+                                .count();
+                            let stats = pipeline.pipeline_stats();
+                            let candidate = ChannelScore {
+                                frames: validated,
+                                sync_locked: stats.sync_locked.unwrap_or(0),
+                                sync_distance: pipeline.best_sync_distance(),
+                            };
+                            if channel_score_better(&best, &candidate) {
+                                best = candidate;
+                                best_skip = sample_skip;
+                            }
                         }
                     }
                 }
+                sample_skip += skip_step;
             }
-            sample_skip += skip_step;
-        }
-        if best.frames == 0 && best.sync_locked == 0 && best.sync_distance.is_none() {
-            return None;
-        }
-        Some(ChannelCandidate {
-            hint: IqAlignmentHint {
-                sample_skip: best_skip,
-                differential: cand_diff,
-                invert: cand_invert,
-                swap_iq: cand_swap,
-            },
-            score: best,
-        })
-    };
+            if best.frames == 0 && best.sync_locked == 0 && best.sync_distance.is_none() {
+                return None;
+            }
+            Some(ChannelCandidate {
+                hint: IqAlignmentHint {
+                    sample_skip: best_skip,
+                    differential: cand_diff,
+                    invert: cand_invert,
+                    swap_iq: cand_swap,
+                },
+                score: best,
+            })
+        };
 
-    combos.par_iter().filter_map(per_combo).reduce_with(|prev, next| {
-        if channel_score_better(&prev.score, &next.score) {
-            next
-        } else {
-            prev
-        }
-    })
+    combos
+        .par_iter()
+        .filter_map(per_combo)
+        .reduce_with(|prev, next| {
+            if channel_score_better(&prev.score, &next.score) {
+                next
+            } else {
+                prev
+            }
+        })
 }
 
 /// Discrimination score for a channelized coarse-search candidate.
@@ -1443,8 +1447,7 @@ where
         // Parallel phase-1 decode chain for CCSDS concatenated downlinks: a
         // second Viterbi + NRZ-S + framer covering the opposite symbol-pairing
         // phase. Built only when there is an inner Viterbi to pair against.
-        let inner_viterbi_phase1 =
-            ccsds_concat.map(|_| openhoshimi_codec::StreamingViterbi::new());
+        let inner_viterbi_phase1 = ccsds_concat.map(|_| openhoshimi_codec::StreamingViterbi::new());
         let inner_nrzs_phase1 = match ccsds_concat {
             Some((_, true)) => Some(0u8),
             _ => None,
@@ -2583,8 +2586,7 @@ mod differential_gating_tests {
     /// flipped it on and decoded zero real frames.
     #[test]
     fn ccsds_concat_downlink_pins_demod_differential() {
-        let def = load_satellite(&satellite_dir().join("ASRTU-1.toml"))
-            .expect("load ASRTU-1.toml");
+        let def = load_satellite(&satellite_dir().join("ASRTU-1.toml")).expect("load ASRTU-1.toml");
         assert!(!def.downlinks.is_empty());
         for dl in &def.downlinks {
             assert!(
@@ -2647,8 +2649,7 @@ mod differential_gating_tests {
             })
             .collect();
 
-        if let Some(result) =
-            search_linear_iq_alignment_scored(downlink, sample_rate, &prefix, 0.0)
+        if let Some(result) = search_linear_iq_alignment_scored(downlink, sample_rate, &prefix, 0.0)
         {
             assert_eq!(
                 result.hint.differential, *config_differential,

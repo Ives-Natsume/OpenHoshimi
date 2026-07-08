@@ -1043,7 +1043,9 @@ mod tests {
         // statically (frequency_offset_hz = 0), at a realistic 40 samples per
         // symbol, and require bit-exact recovery up to the BPSK 180-degree
         // phase ambiguity.
-        let bits: Vec<u8> = (0..240u32).map(|i| u8::from((i * 7 + 3) % 5 == 0)).collect();
+        let bits: Vec<u8> = (0..240u32)
+            .map(|i| u8::from((i * 7 + 3) % 5 == 0))
+            .collect();
         let symbols: Vec<IqSample> = bits
             .iter()
             .map(|b| IqSample {
@@ -1151,7 +1153,11 @@ mod tests {
         // a pattern boundary so the 4-symbol cycle indexes cleanly.
         let skip_pairs = 20usize;
         let pairs: Vec<&[u8]> = recovered.chunks(2).skip(skip_pairs).collect();
-        assert!(pairs.len() > 40, "too few QPSK pairs recovered: {}", pairs.len());
+        assert!(
+            pairs.len() > 40,
+            "too few QPSK pairs recovered: {}",
+            pairs.len()
+        );
         // Find the phase of the first settled pair within the 4-symbol cycle.
         let phase = (0..4)
             .find(|&p| {
@@ -1201,7 +1207,9 @@ mod tests {
         // settled region is inspected. The former 16-symbol burst was
         // shorter than the joint RRC + timing warm-up. 200 DBPSK symbols
         // leaves an ample locked tail.
-        let bits: Vec<u8> = (0..200u32).map(|i| u8::from((i * 13 + 5) % 7 < 3)).collect();
+        let bits: Vec<u8> = (0..200u32)
+            .map(|i| u8::from((i * 13 + 5) % 7 < 3))
+            .collect();
         let mut symbol = 1.0f32;
         let mut symbol_stream: Vec<f32> = Vec::new();
         for &bit in &bits {
@@ -1245,7 +1253,8 @@ mod tests {
             if recovered.len() < tail + shift {
                 continue;
             }
-            let recovered_tail = &recovered[recovered.len() - tail - shift..recovered.len() - shift];
+            let recovered_tail =
+                &recovered[recovered.len() - tail - shift..recovered.len() - shift];
             let mismatches = recovered_tail
                 .iter()
                 .zip(expected_tail)

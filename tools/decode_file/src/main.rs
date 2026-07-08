@@ -1033,7 +1033,10 @@ fn build_channelized_iq_runner(
     let mut prefix_filter = ChannelFilter::new(input_sample_rate, channel_offset_hz, decimation);
     let decimated_prefix = prefix_filter.push(&prefix);
     let pending: Vec<IqSample> = if setup.sample_skip < decimated_prefix.len() {
-        decimated_prefix.into_iter().skip(setup.sample_skip).collect()
+        decimated_prefix
+            .into_iter()
+            .skip(setup.sample_skip)
+            .collect()
     } else {
         Vec::new()
     };

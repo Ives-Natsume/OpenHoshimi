@@ -1244,7 +1244,9 @@ mod tests {
         // regression guard for the timing-error detector: the tracker was
         // previously dead code with a non-standard TED and did not lock.
         let sps = 5.2f32;
-        let bits: Vec<u8> = (0..300u32).map(|i| u8::from((i * 11 + 3) % 5 < 2)).collect();
+        let bits: Vec<u8> = (0..300u32)
+            .map(|i| u8::from((i * 11 + 3) % 5 < 2))
+            .collect();
         // Upsample with a nearest-sample hold at the fractional period.
         let mut stream: Vec<f32> = Vec::new();
         let total = bits.len() as f32 * sps;
@@ -1275,7 +1277,11 @@ mod tests {
                 continue;
             }
             let recovered = &out[out.len() - tail - shift..out.len() - shift];
-            let errors = recovered.iter().zip(expected).filter(|(a, b)| a != b).count();
+            let errors = recovered
+                .iter()
+                .zip(expected)
+                .filter(|(a, b)| a != b)
+                .count();
             best = best.min(errors.min(tail - errors));
         }
         assert_eq!(best, 0, "gardner did not lock: tail errors {best}");

@@ -387,13 +387,8 @@ mod tests {
     fn push_bits_with_soft_matches_hard_framing() {
         // The soft variant must lock and slice identically to push_bits.
         let mut hard = SyncwordFramer::new(&[1, 0, 1, 1], 1, 4);
-        let mut soft = SyncwordFramer::with_frame_options(
-            &[1, 0, 1, 1],
-            1,
-            4,
-            FrameType::Ccsds,
-            false,
-        );
+        let mut soft =
+            SyncwordFramer::with_frame_options(&[1, 0, 1, 1], 1, 4, FrameType::Ccsds, false);
         let bits = [0u8, 0, 1, 0, 0, 1, 1, 0, 1, 1];
         let hard_frames = hard.push_bits(&bits);
         let soft_frames = soft.push_bits_with_soft(&bits, &vec![1.0; bits.len()]);

@@ -338,9 +338,7 @@ fn decode_hit(symbols: &[(f32, f32)], hit: &AsmHit) -> Option<Frame> {
     // decode), de-rotate, and re-decode. Opt-in: the default block path is the
     // proven constant-frequency decode.
     if std::env::var_os("OPENHOSHIMI_BLOCK_ITER").is_some() {
-        if let Some((q, bits, rel)) =
-            refine_phase(window, scale, hit.phase, best_dphi, asm_index)
-        {
+        if let Some((q, bits, rel)) = refine_phase(window, scale, hit.phase, best_dphi, asm_index) {
             if q > best_quality {
                 codeword_bits = bits;
                 codeword_rel = rel;
