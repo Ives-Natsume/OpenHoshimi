@@ -6,5 +6,8 @@
 /// Analytic signal source (Hilbert transform wrapper).
 pub mod analytic;
 
+/// Offline block CCSDS frame recovery via ASM correlation.
+pub mod block_demod;
+
 /// Shared decode pipeline and runtime state.
 pub mod pipeline;

@@ -217,6 +217,13 @@ fn run() -> Result<(), String> {
         runner.description()
     );
 
+    // Opt-in offline block decoder: recover CCSDS frames by ASM correlation
+    // after the stream ends, catching frames the streaming loops never locked.
+    let block_demod = std::env::var_os("OPENHOSHIMI_BLOCK_DEMOD").is_some();
+    if block_demod {
+        runner.enable_block_demod();
+    }
+
     let mut frame_count = 0usize;
     loop {
         let batch = runner.read_next_batch()?;
@@ -270,6 +277,35 @@ fn run() -> Result<(), String> {
                 }
                 BatchEntry::DecodeError(err) => {
                     eprintln!("decode_file: failed to decode frame #{frame_count:03}: {err}");
+                }
+            }
+        }
+    }
+
+    // Offline block decoder pass: recover frames by ASM correlation over the
+    // whole run, decoded through the same codec (RS + erasures + sanity gate)
+    // as the streaming frames, so false correlation peaks are rejected.
+    if block_demod {
+        let block_frames = runner.finalize();
+        eprintln!(
+            "decode_file: block decoder recovered {} candidate codeword(s)",
+            block_frames.len()
+        );
+        for mut frame in block_frames {
+            frame.satellite_id = satellite.satellite.norad_id;
+            frame_count += 1;
+            let timestamp = runner.timestamp();
+            match runner.decode_frame(&frame) {
+                Ok(decoded) => print_decoded_frame(
+                    frame_count,
+                    timestamp,
+                    decoded,
+                    &frame.raw,
+                    telemetry.as_ref(),
+                    &mut image_reassembler,
+                ),
+                Err(err) => {
+                    eprintln!("decode_file: block frame #{frame_count:03} failed: {err}");
                 }
             }
         }
@@ -530,6 +566,26 @@ impl PipelineRunner {
             Self::IqSoftAo40 { .. } => {
                 Err("IqSoftAo40 pipeline decodes inline; pending frames are not used".to_string())
             }
+        }
+    }
+
+    /// Enable offline ASM-correlation block decoding on the underlying pipeline.
+    fn enable_block_demod(&mut self) {
+        match self {
+            Self::Audio { pipeline, .. } => pipeline.enable_block_demod(),
+            Self::FmAudio { pipeline, .. } => pipeline.enable_block_demod(),
+            Self::Iq { pipeline, .. } => pipeline.enable_block_demod(),
+            Self::IqSoftAo40 { .. } => {}
+        }
+    }
+
+    /// Recover frames from the block decoder after the stream ends.
+    fn finalize(&self) -> Vec<Frame> {
+        match self {
+            Self::Audio { pipeline, .. } => pipeline.finalize(),
+            Self::FmAudio { pipeline, .. } => pipeline.finalize(),
+            Self::Iq { pipeline, .. } => pipeline.finalize(),
+            Self::IqSoftAo40 { .. } => Vec::new(),
         }
     }
 

@@ -1348,6 +1348,12 @@ where
     /// it fires, the decoder's internal pending-symbol carry keeps the two
     /// phases interleaved across `push_samples` batches.
     phase1_primed: bool,
+    /// Accumulated complex decision symbols for the offline block decoder, when
+    /// enabled via [`enable_block_demod`](BitPipeline::enable_block_demod). The
+    /// streaming path is untouched; [`finalize`](BitPipeline::finalize) replays
+    /// these through ASM correlation after the stream ends to recover frames
+    /// the streaming loops could not lock. `None` keeps block decoding off.
+    block_symbols: Option<Vec<(f32, f32)>>,
     framer: FrameStage,
     codec: CodecStage,
     total_samples: u64,
@@ -1460,6 +1466,7 @@ where
             inner_nrzs_phase1_prev_rel: 0.0,
             framer_phase1,
             phase1_primed: false,
+            block_symbols: None,
             framer: build_framer(downlink)?,
             codec: build_codec(downlink)?,
             total_samples: 0,
@@ -1485,6 +1492,37 @@ where
         self.framer_phase1 = None;
     }
 
+    /// Enable offline block decoding: accumulate the demodulator's complex
+    /// decision symbols so [`finalize`](Self::finalize) can recover frames by
+    /// ASM correlation after the stream ends. Only meaningful for CCSDS
+    /// concatenated downlinks whose demodulator exposes complex symbols; a
+    /// no-op otherwise. The streaming decode path is unaffected.
+    pub fn enable_block_demod(&mut self) {
+        if self.inner_viterbi.is_some() {
+            self.block_symbols = Some(Vec::new());
+        }
+    }
+
+    /// Run the offline block decoder over the symbols accumulated during the
+    /// stream and return any frames it recovers. Empty unless block decoding
+    /// was enabled with [`enable_block_demod`](Self::enable_block_demod). The
+    /// recovered frames are 255-byte CCSDS codewords for the same outer RS
+    /// stage the streaming frames use.
+    pub fn finalize(&self) -> Vec<Frame> {
+        let Some(symbols) = self.block_symbols.as_ref() else {
+            return Vec::new();
+        };
+        // Normalised correlation threshold and minimum peak separation. The
+        // threshold sits just above the noise floor observed on real passes
+        // (~40 for a 52-tap template); false peaks fail the outer RS decode.
+        let threshold = std::env::var("OPENHOSHIMI_BLOCK_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(40.0);
+        crate::block_demod::recover_frames(symbols, threshold, 2000)
+    }
+
     /// Feed a chunk of samples into the pipeline.
     pub fn push_samples(&mut self, samples: &[S]) -> Vec<Frame> {
         let Some(demodulator) = self.demodulator.as_mut() else {
@@ -1493,6 +1531,12 @@ where
 
         self.total_samples += samples.len() as u64;
         let mut bits = demodulator.push_samples(samples);
+        // Tap the demodulator's complex decision symbols for the offline block
+        // decoder before any per-bit transform mutates the stream. No-op unless
+        // block decoding was enabled.
+        if let Some(block) = self.block_symbols.as_mut() {
+            block.extend_from_slice(demodulator.last_symbol_iq());
+        }
         if let Some(line_decoder) = self.line_decoder.as_mut() {
             line_decoder.decode(&mut bits);
         }

@@ -196,6 +196,12 @@ pub struct LinearDemodulator {
     /// -> positive, bit `1` -> negative, magnitude = reliability). Populated
     /// for binary (BPSK/DBPSK) modes so the streaming Viterbi can run soft.
     last_soft_i8: Vec<i8>,
+    /// Complex post-timing decision symbol `(i, q)` for each bit emitted by
+    /// the most recent `push_samples` call, aligned 1:1 with `last_soft_i8`.
+    /// Retains the quadrature component (dropped by the real-valued soft) so an
+    /// offline block decoder can re-estimate carrier phase over a whole frame.
+    /// Populated for binary (BPSK/DBPSK) modes only.
+    last_symbol_iq: Vec<(f32, f32)>,
     /// Band-edge FLL for wide frequency acquisition, applied per sample after
     /// AGC/DC-block and before the carrier correction / Costas loop. `None`
     /// when `fll_band_edge_bw <= 0.0`.
@@ -302,6 +308,7 @@ impl LinearDemodulator {
             matched_buffer_q: vec![0.0; buffer_len],
             matched_index: 0,
             last_soft_i8: Vec::new(),
+            last_symbol_iq: Vec::new(),
             band_edge_fll,
         })
     }
@@ -718,6 +725,7 @@ impl Demodulator for LinearDemodulator {
     fn push_samples(&mut self, samples: &[IqSample]) -> Vec<u8> {
         let mut bits = Vec::new();
         self.last_soft_i8.clear();
+        self.last_symbol_iq.clear();
 
         for &sample in samples {
             let sample = self.normalize_sample(sample);
@@ -746,6 +754,7 @@ impl Demodulator for LinearDemodulator {
                     let (bit, soft) = self.slice_binary_paired(current);
                     bits.push(bit);
                     self.last_soft_i8.push(soft);
+                    self.last_symbol_iq.push((current.i, current.q));
                 } else {
                     bits.extend_from_slice(&self.slice_symbol(current));
                 }
@@ -757,6 +766,10 @@ impl Demodulator for LinearDemodulator {
 
     fn last_soft_symbols(&self) -> &[i8] {
         &self.last_soft_i8
+    }
+
+    fn last_symbol_iq(&self) -> &[(f32, f32)] {
+        &self.last_symbol_iq
     }
 
     fn sample_rate(&self) -> u32 {

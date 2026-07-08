@@ -78,6 +78,17 @@ pub trait Demodulator: Send {
     fn last_soft_symbols(&self) -> &[i8] {
         &[]
     }
+
+    /// Optional complex post-timing decision symbols `(i, q)` for each bit
+    /// emitted by the most recent [`push_samples`](Self::push_samples) call,
+    /// aligned 1:1 with that bit vector. Unlike the real-valued soft outputs
+    /// above, these retain the quadrature component, so an offline block
+    /// decoder can re-estimate carrier phase over a whole frame (e.g. from an
+    /// ASM pilot) instead of relying on the streaming carrier loop. The
+    /// default returns an empty slice for demodulators that do not expose it.
+    fn last_symbol_iq(&self) -> &[(f32, f32)] {
+        &[]
+    }
 }
 
 /// Decodes a line-coded bit stream in place.
