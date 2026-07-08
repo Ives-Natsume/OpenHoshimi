@@ -252,16 +252,16 @@ impl LinearDemodulator {
         } else {
             TAU * config.baudrate as f32 / config.sample_rate as f32
         };
-        // The RRC decision-path matched filter and the band-edge FLL's
-        // band-edge design both read a roll-off value, but from DIFFERENT
-        // config fields so callers can feed the FLL a roll-off without turning
-        // on the RRC decision path (prior A/B showed the RRC midpoint-decision
-        // path regresses ASRTU-1). The RRC matched filter is driven solely by
-        // `matched_filter_rolloff`; the FLL roll-off is `fll_band_edge_rolloff`
-        // (see above). When the band-edge FLL is active we additionally force
-        // the RRC decision path off as a belt-and-braces guard, since the
-        // pipeline feeds `matched_filter_rolloff` into the FLL roll-off.
-        let matched_taps = if config.matched_filter_rolloff > 0.0 && !band_edge_active {
+        // The RRC decision-path matched filter is driven by
+        // `matched_filter_rolloff`; the band-edge FLL's own roll-off is the
+        // separate `fll_band_edge_rolloff`. An earlier A/B found the RRC path
+        // regressed ASRTU-1 and it was force-disabled whenever the band-edge
+        // FLL was active -- but that regression was the RRC group delay sitting
+        // inside the per-sample Costas phase loop. Now that the Costas loop runs
+        // after timing recovery, the matched filter only lands in the Kay
+        // frequency loop (a slow leaky integrator tolerant of the delay), so the
+        // guard is obsolete: honour `matched_filter_rolloff` directly.
+        let matched_taps = if config.matched_filter_rolloff > 0.0 {
             let span = if config.matched_filter_span_symbols == 0 {
                 6
             } else {
@@ -299,7 +299,16 @@ impl LinearDemodulator {
                     BoxcarFilter::matched(samples_per_symbol),
                 ))
             },
-            timing: GardnerTracker::new(samples_per_symbol),
+            // The RRC matched filter has a steeper zero-crossing than the
+            // boxcar, so its Gardner TED slope is roughly double; halving the
+            // loop bandwidth keeps the realized loop gain (and thus the damping)
+            // where the boxcar path had it. Without this the RRC path is badly
+            // under-damped and drops ~half the strong-pass frames (52 -> 26).
+            timing: if matched_taps.is_some() {
+                GardnerTracker::with_constants(samples_per_symbol, 0.03, 1.0, 1.47, 0.08)
+            } else {
+                GardnerTracker::new(samples_per_symbol)
+            },
             config,
             carrier_phase: 0.0,
             previous_binary_symbol: None,

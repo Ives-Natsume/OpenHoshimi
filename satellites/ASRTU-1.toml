@@ -28,15 +28,16 @@ mode = "bpsk"
 # coarse frequency acquisition with a wide +/-~2*baud (~19.2 kHz) pull-in, then
 # the Costas loop tracks the residual carrier phase. The band-edge FLL
 # supersedes the Kay squared-symbol FLL (frequency_loop_bandwidth) when active,
-# so the two frequency loops never fight. matched_filter_rolloff (0.35) only
-# feeds the band-edge filter design; matched filtering is left OFF in the
-# decision path (integrate-and-dump locks this 9k6 BPSK; the RRC midpoint
-# decision closes the eye, see peak_symbol_sample). Verified decoding real SSDV
-# frames from a recorded pass.
+# so the two frequency loops never fight. The transmit pulse is RRC with
+# roll-off 0.35, so matched_filter_rolloff enables the matching RRC receive
+# filter in the decision path (a matched filter over the boxcar
+# integrate-and-dump); it also feeds the band-edge filter design. Verified
+# decoding real SSDV frames from a recorded pass.
 carrier_loop_bandwidth = 0.05
 frequency_loop_bandwidth = 0.02
 nco_max_offset_hz = 6000.0
 fll_band_edge_bw = 0.01
+matched_filter_rolloff = 0.35
 
 [downlink.framer]
 kind = "syncword"
@@ -67,15 +68,16 @@ mode = "bpsk"
 # coarse frequency acquisition with a wide +/-~2*baud (~19.2 kHz) pull-in, then
 # the Costas loop tracks the residual carrier phase. The band-edge FLL
 # supersedes the Kay squared-symbol FLL (frequency_loop_bandwidth) when active,
-# so the two frequency loops never fight. matched_filter_rolloff (0.35) only
-# feeds the band-edge filter design; matched filtering is left OFF in the
-# decision path (integrate-and-dump locks this 9k6 BPSK; the RRC midpoint
-# decision closes the eye, see peak_symbol_sample). Verified decoding real SSDV
-# frames from a recorded pass.
+# so the two frequency loops never fight. The transmit pulse is RRC with
+# roll-off 0.35, so matched_filter_rolloff enables the matching RRC receive
+# filter in the decision path (a matched filter over the boxcar
+# integrate-and-dump); it also feeds the band-edge filter design. Verified
+# decoding real SSDV frames from a recorded pass.
 carrier_loop_bandwidth = 0.05
 frequency_loop_bandwidth = 0.02
 nco_max_offset_hz = 6000.0
 fll_band_edge_bw = 0.01
+matched_filter_rolloff = 0.35
 
 [downlink.framer]
 kind = "syncword"
