@@ -111,14 +111,40 @@ The TOML schema supports:
     Concatenated (Viterbi + RS), FX.25, Geoscan, SSDV
 
 
-7. License
+7. Known Limitations
+--------------------
+
+The decoder is fully blind: it recovers carrier, timing, and frame
+synchronisation from the samples alone, with no TLE or Doppler-model
+assistance.  This keeps it self-contained but means very weak passes
+are bounded by signal-to-noise ratio, not by decoder tuning:
+
+  - Strong and moderate recordings decode fully.  On a reference
+    ASRTU-1 (AO-123) BPSK 9k6 pass, ClosedHoshimi recovers 52 CCSDS
+    frames end-to-end.
+
+  - Recordings whose frame bodies sit at or below the noise floor
+    (low-elevation passes, deep fades) may yield zero frames even when
+    a frame sync marker is briefly detectable.  The attached sync
+    marker can correlate out of the noise while the 2040-bit frame body
+    remains too corrupted for the Reed-Solomon outer code to recover.
+    This is an SNR limit of blind reception, not a bug; external tools
+    that apply a TLE-derived Doppler model may extract a few extra
+    frames from the same audio under non-blind conditions.
+
+Practically: if a recording is decodable at all, feed the highest-
+quality capture available (IQ preferred over FM-discriminator audio,
+widest bandwidth that still isolates the signal).
+
+
+8. License
 ----------
 
 ClosedHoshimi is free software, released under the GNU General Public
 License version 3 or later.  See the COPYING file for details.
 
 
-8. Contributing
+9. Contributing
 ---------------
 
 Patches are welcome.  Please ensure:
