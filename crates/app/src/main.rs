@@ -1294,7 +1294,7 @@ impl ClosedHoshimiApp {
                     );
                     painter.line_segment(
                         [rect.left_bottom(), rect.right_bottom()],
-                        Stroke::new(1.0, Palette::LINE),
+                        Stroke::new(1.0_f32, Palette::LINE),
                     );
 
                     painter.text(
@@ -1615,7 +1615,7 @@ impl ClosedHoshimiApp {
             .unwrap_or(&[]);
         Frame::new()
             .fill(Palette::PANEL)
-            .stroke(Stroke::new(1.0, Palette::LINE))
+            .stroke(Stroke::new(1.0_f32, Palette::LINE))
             .inner_margin(Margin::same(4))
             .show(ui, |ui| {
                 ui.set_min_height(96.0);
@@ -2229,7 +2229,7 @@ impl ClosedHoshimiApp {
     fn input_panel(&mut self, ui: &mut egui::Ui) {
         Frame::new()
             .fill(Palette::PANEL)
-            .stroke(Stroke::new(1.0, Palette::LINE))
+            .stroke(Stroke::new(1.0_f32, Palette::LINE))
             .inner_margin(Margin::same(4))
             .show(ui, |ui| {
                 group_header(ui, "Input");
@@ -2259,7 +2259,7 @@ impl ClosedHoshimiApp {
     fn diagnostics_panel(&mut self, ui: &mut egui::Ui) {
         Frame::new()
             .fill(Palette::PANEL)
-            .stroke(Stroke::new(1.0, Palette::LINE))
+            .stroke(Stroke::new(1.0_f32, Palette::LINE))
             .inner_margin(Margin::same(4))
             .show(ui, |ui| {
                 group_header(ui, "Diagnostics");
@@ -3789,7 +3789,7 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = Palette::BG;
     style.visuals.window_fill = Palette::BG;
-    style.visuals.window_stroke = Stroke::new(1.0, Palette::LINE);
+    style.visuals.window_stroke = Stroke::new(1.0_f32, Palette::LINE);
     style.visuals.window_corner_radius = CornerRadius::ZERO;
     style.visuals.menu_corner_radius = CornerRadius::ZERO;
     style.visuals.extreme_bg_color = Palette::PANEL;
@@ -3820,7 +3820,7 @@ impl Palette {
 fn panel_frame(fill: Color32) -> Frame {
     Frame::new()
         .fill(fill)
-        .stroke(Stroke::new(1.0, Palette::LINE))
+        .stroke(Stroke::new(1.0_f32, Palette::LINE))
         .inner_margin(Margin::symmetric(6, 0))
 }
 
@@ -3877,7 +3877,7 @@ fn bracket_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response 
         egui::Button::new(format!("[{label}]"))
             .corner_radius(CornerRadius::ZERO)
             .fill(Palette::PANEL)
-            .stroke(Stroke::new(1.0, Palette::LINE)),
+            .stroke(Stroke::new(1.0_f32, Palette::LINE)),
     )
 }
 
@@ -3895,7 +3895,7 @@ fn tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
         egui::Button::new(RichText::new(format!("[{label}]")).color(text).monospace())
             .corner_radius(CornerRadius::ZERO)
             .fill(fill)
-            .stroke(Stroke::new(1.0, Palette::LINE))
+            .stroke(Stroke::new(1.0_f32, Palette::LINE))
             .min_size(Vec2::new(0.0, 22.0)),
     )
 }
@@ -3962,7 +3962,7 @@ fn demo_field(ui: &mut egui::Ui, key: &str, value: &str, value_color: Color32) {
     let rect = row_rect(ui, 20.0);
     ui.painter().line_segment(
         [rect.left_bottom(), rect.right_bottom()],
-        Stroke::new(1.0, Palette::LINE),
+        Stroke::new(1.0_f32, Palette::LINE),
     );
     let key_chars = key.chars().count();
     let key_width = key_chars as f32 * MONO_11_CHAR_W;
