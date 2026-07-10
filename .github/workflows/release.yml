@@ -2,7 +2,9 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    # Any tag cuts a release, not just v-prefixed ones: named/special tags
+    # (e.g. Mutsumi-XL-TECHNO-<hash>) are first-class release triggers.
+    tags: ["*"]
   # Allow building distributable artifacts on demand without cutting a tag.
   # A GitHub Release is only created for tag pushes (see the `release` job).
   workflow_dispatch:
@@ -104,7 +106,7 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:
