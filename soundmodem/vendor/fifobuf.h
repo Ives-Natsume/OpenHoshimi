@@ -79,8 +79,14 @@ extern "C" {
 //#include <cpu/irq.h>
 //#incsude <cfg/debug.h>
 
+/* __builtin_expect is GCC/Clang only; degrade to identity on MSVC etc. */
+#if defined(__GNUC__) || defined(__clang__)
 #define LIKELY(x)               __builtin_expect(!!(x), 1)
 #define UNLIKELY(x)             __builtin_expect(!!(x), 0)
+#else
+#define LIKELY(x)               (x)
+#define UNLIKELY(x)             (x)
+#endif
 
 typedef struct FIFOBuffer
 {
