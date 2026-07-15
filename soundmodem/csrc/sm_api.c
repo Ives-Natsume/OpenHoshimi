@@ -7,7 +7,7 @@
  * each run an independent K=7 Viterbi decoder followed by a CCSDS deframer
  * (ASM sync, NRZ-M differential, descramble, RS(255,223)).
  *
- * Copyright 2026 Izumi Chino
+ * Copyright 2026 Izumi Chino, Mashiro Chen and Hyacinth Satellite Team
  */
 
 #include "sm_api.h"

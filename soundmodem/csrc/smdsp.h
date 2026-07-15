@@ -19,7 +19,8 @@
  * caller may run independent decoders concurrently.
  *
  * Copyright 2015 WEI Mingchuan, BG2BHC and HIT (upstream algorithm)
- * Copyright 2026 Izumi Chino (C99 reentrant port)
+ * Copyright 2026 Izumi Chino, Mashiro Chen and Hyacinth Satellite Team
+ * (C99 reentrant port)
  */
 
 #ifndef OPENHOSHIMI_SMDSP_H

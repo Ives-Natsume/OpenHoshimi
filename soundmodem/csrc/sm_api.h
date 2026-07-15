@@ -7,7 +7,7 @@
  * suitable for FFI. The caller feeds int16 audio at SM_RATE (48 kHz mono,
  * 12 kHz IF) and polls decoded 223-byte CCSDS frames.
  *
- * Copyright 2026 Izumi Chino
+ * Copyright 2026 Izumi Chino, Mashiro Chen and Hyacinth Satellite Team
  */
 
 #ifndef OPENHOSHIMI_SM_API_H
