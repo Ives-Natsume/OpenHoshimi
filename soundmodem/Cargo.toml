@@ -1,0 +1,12 @@
+[package]
+name = "openhoshimi-soundmodem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-3.0-or-later"
+repository.workspace = true
+authors.workspace = true
+description = "ASRTU-1 CCSDS decoder backed by the vendored HIT LilacSat soundmodem C core"
+
+[build-dependencies]
+cc = "1"

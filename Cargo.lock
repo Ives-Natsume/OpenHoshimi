@@ -1010,6 +1010,7 @@ dependencies = [
  "openhoshimi-dsp",
  "openhoshimi-io",
  "openhoshimi-runtime",
+ "openhoshimi-soundmodem",
  "openhoshimi-telemetry",
 ]
 
@@ -2766,8 +2767,17 @@ dependencies = [
  "openhoshimi-core",
  "openhoshimi-dsp",
  "openhoshimi-io",
+ "openhoshimi-soundmodem",
  "openhoshimi-telemetry",
  "rayon",
+ "rustfft",
+]
+
+[[package]]
+name = "openhoshimi-soundmodem"
+version = "1.7.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

@@ -50,6 +50,17 @@ struct Args {
     /// the image pipeline without launching the GUI.
     #[arg(long)]
     dump_images: Option<PathBuf>,
+    /// Decode ASRTU-1 (AO-123) through the vendored soundmodem C backend
+    /// instead of the pure-Rust pipeline. Reads the input as stereo IQ,
+    /// re-tunes per window to follow Doppler, and feeds the C decoder.
+    #[arg(long)]
+    soundmodem: bool,
+    /// Feed a 48 kHz mono 12 kHz-IF WAV straight into the soundmodem C decoder,
+    /// bypassing the IQ front-end. This is the official soundmodem input format
+    /// (e.g. produced by SDR#); useful as a reference and to isolate front-end
+    /// versus decoder behaviour.
+    #[arg(long)]
+    soundmodem_raw: bool,
 }
 
 /// How the input file should be interpreted.
@@ -75,8 +86,99 @@ fn main() -> ExitCode {
     }
 }
 
+/// Decode ASRTU-1 via the vendored soundmodem C backend: slurp the input as
+/// stereo IQ and hand it to the windowed front-end, printing each frame.
+fn run_soundmodem(input: &Path) -> Result<(), String> {
+    let mut source =
+        WavIqSource::open(input).map_err(|err| format!("failed to open IQ WAV: {err}"))?;
+    let fs = source.sample_rate();
+    eprintln!("decode_file: soundmodem backend, IQ input at {fs} Hz");
+
+    let mut iq: Vec<IqSample> = Vec::new();
+    let mut buf = vec![IqSample { i: 0.0, q: 0.0 }; 65536];
+    let src: &mut dyn IqSource = &mut source;
+    loop {
+        match src.read_samples(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => iq.extend_from_slice(&buf[..n]),
+            Err(IoError::EndOfStream) => break,
+            Err(err) => return Err(format!("IQ read error: {err}")),
+        }
+    }
+    eprintln!(
+        "decode_file: read {} IQ samples ({:.1}s)",
+        iq.len(),
+        iq.len() as f32 / fs as f32
+    );
+
+    let frames = openhoshimi_runtime::soundmodem_frontend::decode_iq(&iq, fs);
+    print_sm_frames(&frames);
+    Ok(())
+}
+
+/// Print soundmodem frames (`#NNN corrected=C  <hex>`), full payload under
+/// `OPENHOSHIMI_SM_FULL`, else the first 16 bytes.
+fn print_sm_frames(frames: &[openhoshimi_soundmodem::Frame]) {
+    let full = std::env::var_os("OPENHOSHIMI_SM_FULL").is_some();
+    for (i, f) in frames.iter().enumerate() {
+        let take = if full { f.data.len() } else { 16 };
+        let hex: String = f
+            .data
+            .iter()
+            .take(take)
+            .map(|b| format!("{b:02x} "))
+            .collect();
+        println!(
+            "#{:03} corrected={:<3}  {}",
+            i + 1,
+            f.corrected,
+            hex.trim_end()
+        );
+    }
+    eprintln!("decode_file: soundmodem decoded {} frame(s)", frames.len());
+}
+
+/// Feed a 48 kHz mono 12 kHz-IF WAV straight into the soundmodem C decoder,
+/// bypassing the IQ front-end (the official soundmodem input format).
+fn run_soundmodem_raw(input: &Path) -> Result<(), String> {
+    let mut source = open_audio_source(input)?;
+    let fs = source.sample_rate();
+    if fs != openhoshimi_soundmodem::SAMPLE_RATE {
+        eprintln!(
+            "decode_file: warning: soundmodem raw expects {} Hz mono, got {fs} Hz",
+            openhoshimi_soundmodem::SAMPLE_RATE
+        );
+    }
+    let mut dec = openhoshimi_soundmodem::Decoder::new().ok_or("decoder alloc failed")?;
+    let mut buf = [0.0f32; 4096];
+    let mut frames = Vec::new();
+    loop {
+        match source.read_samples(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let pcm: Vec<i16> = buf[..n].iter().map(|&x| (x * 32767.0) as i16).collect();
+                frames.extend(dec.feed_collect(&pcm));
+            }
+            Err(IoError::EndOfStream) => break,
+            Err(err) => return Err(format!("audio read error: {err}")),
+        }
+    }
+    dec.flush();
+    while let Some(f) = dec.poll() {
+        frames.push(f);
+    }
+    print_sm_frames(&frames);
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args = Args::parse();
+    if args.soundmodem_raw {
+        return run_soundmodem_raw(&args.input_wav);
+    }
+    if args.soundmodem {
+        return run_soundmodem(&args.input_wav);
+    }
     if let Some(path) = std::env::var_os("OPENHOSHIMI_SYMBOL_DUMP") {
         open_symbol_dump(Path::new(&path))
             .map_err(|err| format!("failed to open symbol dump file: {err}"))?;

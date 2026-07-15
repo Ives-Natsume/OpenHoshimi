@@ -19,4 +19,5 @@ openhoshimi-codec = { workspace = true }
 openhoshimi-telemetry = { workspace = true }
 openhoshimi-io = { workspace = true }
 openhoshimi-runtime = { workspace = true }
+openhoshimi-soundmodem = { workspace = true }
 clap = { workspace = true }

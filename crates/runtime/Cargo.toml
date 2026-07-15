@@ -14,7 +14,9 @@ openhoshimi-dsp = { workspace = true }
 openhoshimi-codec = { workspace = true }
 openhoshimi-telemetry = { workspace = true }
 openhoshimi-io = { workspace = true }
+openhoshimi-soundmodem = { workspace = true }
 rayon = { workspace = true }
+rustfft = { workspace = true }
 
 [dev-dependencies]
 crc = "3"

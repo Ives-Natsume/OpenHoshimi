@@ -8,6 +8,7 @@ members = [
     "crates/io",
     "crates/runtime",
     "crates/app",
+    "soundmodem",
     "tools/decode_file",
     "tools/iq_inspect",
     "tools/cpm_dump",
@@ -30,6 +31,7 @@ openhoshimi-codec = { path = "crates/codec" }
 openhoshimi-telemetry = { path = "crates/telemetry" }
 openhoshimi-io = { path = "crates/io" }
 openhoshimi-runtime = { path = "crates/runtime" }
+openhoshimi-soundmodem = { path = "soundmodem" }
 
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
