@@ -116,18 +116,10 @@ fn run_soundmodem(input: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Print soundmodem frames (`#NNN corrected=C  <hex>`), full payload under
-/// `OPENHOSHIMI_SM_FULL`, else the first 16 bytes.
+/// Print soundmodem frames as `#NNN corrected=C  <full 223-byte hex payload>`.
 fn print_sm_frames(frames: &[openhoshimi_soundmodem::Frame]) {
-    let full = std::env::var_os("OPENHOSHIMI_SM_FULL").is_some();
     for (i, f) in frames.iter().enumerate() {
-        let take = if full { f.data.len() } else { 16 };
-        let hex: String = f
-            .data
-            .iter()
-            .take(take)
-            .map(|b| format!("{b:02x} "))
-            .collect();
+        let hex: String = f.data.iter().map(|b| format!("{b:02x} ")).collect();
         println!(
             "#{:03} corrected={:<3}  {}",
             i + 1,
