@@ -1,18 +1,18 @@
-//! Streaming IQ front-end for the vendored soundmodem C decoder.
+//! IQ front-end for the vendored soundmodem C decoder.
 //!
 //! The C core ([`openhoshimi_soundmodem`]) demodulates 48 kHz complex baseband
 //! near 0 Hz with a narrow FLL pull-in range. Real recordings arrive as complex
 //! baseband at arbitrary rates and, on low passes, sweep tens of kHz of Doppler.
-//! [`StreamDecoder`] bridges the two as a causal push/pull state machine so the
-//! same path serves both offline files and a live SDR/soundcard source:
+//! [`decode_iq`] bridges the two with a survey / fit / replay pipeline that uses
+//! the RS code, not any acquisition threshold, as the judge of a real frame:
 //!
-//!   * input is consumed in ~1 s causal blocks (no whole-file look-ahead);
-//!   * a SEARCH -> LOCKED -> COAST tracker follows one emitter's `s^2` line,
-//!     confirming a new carrier over several blocks before re-anchoring so FM
-//!     splatter, dropouts and mid-recording retunes are ordinary transitions;
-//!   * each block is mixed to 0 Hz by a phase-continuous NCO and resampled to
-//!     48 kHz by a stateful polyphase resampler, then fed to one C decoder that
-//!     is reset only when the carrier re-anchors far away (a retune).
+//!   * survey the strongest `s^2` carrier line once per second (no gating);
+//!   * fit smooth Doppler tracks through the confident detections by RANSAC,
+//!     the collinearity and slew constraints rejecting the scattered noise
+//!     peaks that a scalar margin threshold never cleanly could;
+//!   * replay each track through its own decoder, mixing along the fitted
+//!     carrier curve so the Doppler is de-rotated and the signal energy stays
+//!     coherent across a whole burst.
 //!
 //! This is the ASRTU-1 path only; every other satellite keeps the pure-Rust
 //! pipeline.
@@ -34,46 +34,8 @@ const DC_GUARD_HZ: f32 = 500.0;
 
 /// Number of distinct `s^2` peaks kept per block for the tracker to choose from.
 const TOP_K: usize = 8;
-
-/// Max carrier slew per block the tracker will follow (Hz). Wider than any LEO
-/// Doppler step yet far tighter than the gap to a competing emitter.
-const TRACK_SEARCH_HZ: f32 = 4000.0;
-
 /// Half-width, in output taps, of the resampler's anti-alias prototype.
 const RESAMPLE_HALF_SPAN: usize = 10;
-
-/// `s^2` margin a peak must clear to keep the lock. Below this the block is
-/// treated as a fade and the tracker coasts on the last carrier rather than
-/// chasing an FM/noise peak (margin ~10-15) off the true Doppler line.
-const HOLD_MARGIN: f32 = 20.0;
-
-/// `s^2` margin a candidate must clear to acquire the lock. Real emitters run in
-/// the hundreds; FM splatter false peaks sit around 10-15, so this rejects them.
-const ACQUIRE_MARGIN: f32 = 12.0;
-
-/// Consecutive blocks a candidate line must persist before the tracker locks
-/// onto it, so a one-off spike cannot pull the carrier.
-const ACQUIRE_CONFIRM: usize = 2;
-
-/// `s^2` margin so high the line is unambiguously the signal (FM splatter tops
-/// out ~15); the tracker locks on it in one block, not losing the leading
-/// frames to the confirmation delay.
-const FAST_LOCK_MARGIN: f32 = 100.0;
-
-/// Blocks the tracker feeds a faded lock (holding the last carrier) before
-/// giving up and returning to acquisition. Generous, to ride through long
-/// fades the way a batch tracker would; a retune is caught sooner by the
-/// far-line re-anchor rather than by exhausting this.
-const COAST_MAX: usize = 30;
-
-/// IIR weight damping per-block `s^2` jitter on the tracked carrier into phase
-/// noise; a fresh lock sets the carrier directly, bypassing this.
-const CARRIER_SMOOTH: f32 = 0.5;
-
-/// Carrier step (Hz) above which a new lock is treated as a retune, resetting
-/// the decoder rather than forcing its loops to survive a large jump.
-const SEGMENT_JUMP_HZ: f32 = 8000.0;
-
 fn gcd(mut a: usize, mut b: usize) -> usize {
     while b != 0 {
         let t = b;
@@ -142,17 +104,6 @@ fn block_peaks(
     }
 }
 
-/// Strongest peak within the slew limit of `pred` that still clears
-/// [`HOLD_MARGIN`]. A genuine (even faded) BPSK line keeps a concentrated `s^2`
-/// peak, so this holds real signal while a flat-noise block yields nothing and
-/// the tracker coasts on the last carrier instead of chasing noise.
-fn hold_peak(peaks: &[(f32, f32)], pred: f32) -> Option<f32> {
-    peaks
-        .iter()
-        .filter(|(f, m)| (f - pred).abs() <= TRACK_SEARCH_HZ && *m >= HOLD_MARGIN)
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|&(f, _)| f)
-}
 
 /// Stateful rational polyphase resampler (upfirdn) for a streaming complex
 /// signal: `out_rate = in_rate * l / m`. Carries filter history across calls so
@@ -233,256 +184,221 @@ impl StreamResampler {
     }
 }
 
-/// Causal push/pull ASRTU-1 decoder over the soundmodem C backend. Feed complex
-/// baseband at `fs` with [`StreamDecoder::push`]; drain frames with
-/// [`StreamDecoder::take_frames`]. The same object drives offline and live use.
-pub struct StreamDecoder {
-    fs: u32,
-    block_len: usize,
-    fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
-    fbuf: Vec<Complex32>,
-    mag: Vec<f32>,
-    peaks: Vec<(f32, f32)>,
-    accum: Vec<Complex32>,
+// ==== offline replay decoder: survey -> RANSAC Doppler tracks -> replay ====
 
-    locked: bool,
-    carrier: f32,
-    coast: usize,
-    cand: Option<(f32, usize)>,
-    last_lock: f32,
-    ever: bool,
+/// Minimal `s^2` peak-to-mean ratio for a block to seed track fitting. Weak but
+/// generous: physics (collinearity + bounded slew) rejects noise, not this.
+const ANCHOR_MARGIN: f32 = 15.0;
 
-    mix_phase: f64,
-    resampler: StreamResampler,
-    dec: Option<Decoder>,
+/// Max carrier slope (Hz/s) a Doppler track may have; well above LEO Doppler at
+/// 435 MHz, far below the jump to an unrelated noise peak.
+const MAX_SLEW_HZ_S: f32 = 250.0;
 
-    mixed: Vec<Complex32>,
-    resout: Vec<Complex32>,
-    ilv: Vec<f32>,
+/// Frequency tolerance (Hz) for a detection to count as lying on a track.
+const INLIER_TOL_HZ: f32 = 1500.0;
 
-    frames: Vec<Frame>,
-    seen: HashSet<Vec<u8>>,
-    blk: usize,
+/// Seconds padded before/after a track when replaying, so the burst preamble
+/// and trailing frames fall inside the decoded window.
+const REPLAY_PREROLL_S: f32 = 2.0;
+const REPLAY_POSTROLL_S: f32 = 15.0;
+
+/// Anchor windows closer than this merge into one replay span (keeps a
+/// near-continuous signal whole); bursts farther apart stay separate.
+const MERGE_GAP_S: f32 = 30.0;
+
+/// Min anchors on a track for it to be worth replaying. Two is enough: a weak
+/// burst may seed only two anchors yet still decode once de-rotated, so the RS
+/// code, not this, is the real filter.
+const MIN_INLIERS: usize = 2;
+
+/// Max Doppler tracks fit (compute budget); the strongest rank first.
+const MAX_TRACKS: usize = 12;
+
+/// A fitted Doppler track: carrier(t) = a + b*t (Hz), backed by anchors at the
+/// times `ats` (seconds). Replay only visits windows around those anchors, so
+/// the quiet gaps between bursts on one Doppler curve are not re-decoded.
+struct Track {
+    a: f32,
+    b: f32,
+    ats: Vec<f32>,
 }
 
-impl StreamDecoder {
-    /// Create a decoder for complex baseband at `fs` Hz.
-    pub fn new(fs: u32) -> Self {
-        let block_len = fs as usize * BLOCK_SEC;
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(block_len.max(1));
-        Self {
-            fs,
-            block_len,
-            fft,
-            fbuf: vec![Complex32::new(0.0, 0.0); block_len.max(1)],
-            mag: vec![0.0; block_len.max(1)],
-            peaks: Vec::new(),
-            accum: Vec::with_capacity(block_len),
-            locked: false,
-            carrier: 0.0,
-            coast: 0,
-            cand: None,
-            last_lock: 0.0,
-            ever: false,
-            mix_phase: 0.0,
-            resampler: StreamResampler::new(fs, SAMPLE_RATE),
-            dec: None,
-            mixed: Vec::new(),
-            resout: Vec::new(),
-            ilv: Vec::new(),
-            frames: Vec::new(),
-            seen: HashSet::new(),
-            blk: 0,
-        }
+/// Per-1 s block, the strongest `s^2` carrier peak (Hz) and its margin.
+fn survey(cplx: &[Complex32], fs: u32) -> Vec<(f32, f32)> {
+    let block = fs as usize * BLOCK_SEC;
+    let nblocks = cplx.len() / block;
+    if nblocks == 0 {
+        return Vec::new();
     }
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(block);
+    let mut buf = vec![Complex32::new(0.0, 0.0); block];
+    let mut mag = vec![0.0f32; block];
+    let mut peaks = Vec::new();
+    let mut out = Vec::with_capacity(nblocks);
+    for b in 0..nblocks {
+        block_peaks(&cplx[b * block..(b + 1) * block], fs, &fft, &mut buf, &mut mag, &mut peaks);
+        out.push(peaks.first().copied().unwrap_or((0.0, 0.0)));
+    }
+    out
+}
 
-    /// Push complex baseband samples. Decoded frames accumulate internally.
-    pub fn push(&mut self, cplx: &[Complex32]) {
-        let mut off = 0;
-        while off < cplx.len() {
-            let space = self.block_len - self.accum.len();
-            let take = (cplx.len() - off).min(space);
-            self.accum.extend_from_slice(&cplx[off..off + take]);
-            off += take;
-            if self.accum.len() == self.block_len {
-                let block = std::mem::take(&mut self.accum);
-                self.process_block(&block);
-                self.accum = block;
-                self.accum.clear();
+/// Least-squares line fit `freq = a + b*t` through `(t, f)` points.
+fn fit_line(pts: &[(f32, f32)]) -> (f32, f32) {
+    let n = pts.len() as f32;
+    let mt = pts.iter().map(|p| p.0).sum::<f32>() / n;
+    let mf = pts.iter().map(|p| p.1).sum::<f32>() / n;
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for &(t, f) in pts {
+        num += (t - mt) * (f - mf);
+        den += (t - mt) * (t - mt);
+    }
+    let b = if den > 1e-6 { num / den } else { 0.0 };
+    (mf - b * mt, b)
+}
+
+/// RANSAC-fit smooth Doppler tracks through anchor detections `(t_s, f)`, peeling
+/// off the best line each round; the collinearity + slew constraints reject the
+/// scattered noise peaks that no scalar margin threshold could.
+fn ransac_tracks(anchors: &[(f32, f32)]) -> Vec<Track> {
+    let on_line = |a: f32, b: f32, t: f32, f: f32| (f - (a + b * t)).abs() <= INLIER_TOL_HZ;
+    let mut rem: Vec<(f32, f32)> = anchors.to_vec();
+    let mut tracks = Vec::new();
+    while tracks.len() < MAX_TRACKS && rem.len() >= 2 {
+        let mut best: Option<(usize, f32, f32)> = None;
+        for i in 0..rem.len() {
+            for j in (i + 1)..rem.len() {
+                let (t1, f1) = rem[i];
+                let (t2, f2) = rem[j];
+                if (t2 - t1).abs() < 0.5 {
+                    continue;
+                }
+                let b = (f2 - f1) / (t2 - t1);
+                if b.abs() > MAX_SLEW_HZ_S {
+                    continue;
+                }
+                let a = f1 - b * t1;
+                let cnt = rem.iter().filter(|&&(t, f)| on_line(a, b, t, f)).count();
+                if best.map_or(true, |(bc, _, _)| cnt > bc) {
+                    best = Some((cnt, a, b));
+                }
             }
         }
+        let Some((cnt, a, b)) = best else { break };
+        if cnt < 2 {
+            break;
+        }
+        let inl: Vec<(f32, f32)> = rem.iter().copied().filter(|&(t, f)| on_line(a, b, t, f)).collect();
+        rem.retain(|&(t, f)| !on_line(a, b, t, f));
+        if cnt < MIN_INLIERS {
+            continue;
+        }
+        let (a2, b2) = fit_line(&inl);
+        tracks.push(Track {
+            a: a2,
+            b: b2,
+            ats: inl.iter().map(|p| p.0).collect(),
+        });
+    }
+    tracks
+}
+
+/// Replay one Doppler track: over each anchor-centred window (quiet gaps between
+/// bursts skipped), mix to 0 Hz along the fitted carrier curve, resample to
+/// 48 kHz and decode. RS is the sole arbiter.
+fn replay(cplx: &[Complex32], fs: u32, tr: &Track) -> Vec<Frame> {
+    // Merge the padded windows around each anchor into disjoint sample spans.
+    let mut wins: Vec<(usize, usize)> = tr
+        .ats
+        .iter()
+        .map(|&a| {
+            let s0 = ((a - REPLAY_PREROLL_S).max(0.0) * fs as f32) as usize;
+            let s1 = (((a + 1.0 + REPLAY_POSTROLL_S) * fs as f32) as usize).min(cplx.len());
+            (s0, s1)
+        })
+        .collect();
+    // Merge windows separated by less than a burst gap so a near-continuous
+    // signal decodes as one span (no boundary losses), while bursts tens of
+    // seconds apart stay separate and each re-acquires with a fresh decoder.
+    let merge_gap = (MERGE_GAP_S * fs as f32) as usize;
+    wins.sort_unstable();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (s0, s1) in wins {
+        match spans.last_mut() {
+            Some(last) if s0 <= last.1 + merge_gap => last.1 = last.1.max(s1),
+            _ => spans.push((s0, s1)),
+        }
     }
 
-    /// Flush the trailing partial block at end of stream.
-    pub fn finish(&mut self) {
-        if !self.accum.is_empty() {
-            let block = std::mem::take(&mut self.accum);
-            self.process_block(&block);
-            self.accum = block;
-            self.accum.clear();
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let mut frames = Vec::new();
+    for (s0, s1) in spans {
+        if s1 <= s0 {
+            continue;
         }
-        if let Some(dec) = &mut self.dec {
+        let mut phase = 0.0f64;
+        let mixed: Vec<Complex32> = cplx[s0..s1]
+            .iter()
+            .enumerate()
+            .map(|(i, z)| {
+                let t = (s0 + i) as f32 / fs as f32;
+                let fc = tr.a + tr.b * t;
+                phase = (phase - two_pi * fc as f64 / fs as f64).rem_euclid(two_pi);
+                let (s, c) = phase.sin_cos();
+                let (s, c) = (s as f32, c as f32);
+                Complex32::new(z.re * c - z.im * s, z.re * s + z.im * c)
+            })
+            .collect();
+
+        let mut rs = StreamResampler::new(fs, SAMPLE_RATE);
+        let mut res = Vec::new();
+        rs.process(&mixed, &mut res);
+        let mut ilv = Vec::with_capacity(res.len() * 2);
+        for c in &res {
+            ilv.push(c.re);
+            ilv.push(c.im);
+        }
+        if let Some(mut dec) = Decoder::new() {
+            dec.feed_iq(&ilv);
             dec.flush();
             while let Some(f) = dec.poll() {
-                if self.seen.insert(f.data.clone()) {
-                    self.frames.push(f);
-                }
+                frames.push(f);
             }
         }
     }
-
-    /// Take all frames decoded so far (de-duplicated by payload).
-    pub fn take_frames(&mut self) -> Vec<Frame> {
-        std::mem::take(&mut self.frames)
-    }
-
-    fn process_block(&mut self, block: &[Complex32]) {
-        if block.len() == self.block_len {
-            self.blk += 1;
-            self.update_tracking(block);
-        }
-        if self.locked {
-            self.mix_and_feed(block);
-        }
-    }
-
-    /// Advance the SEARCH -> LOCKED -> COAST carrier tracker on a full block.
-    fn update_tracking(&mut self, block: &[Complex32]) {
-        block_peaks(
-            block,
-            self.fs,
-            &self.fft,
-            &mut self.fbuf,
-            &mut self.mag,
-            &mut self.peaks,
-        );
-
-        if self.locked {
-            if let Some(f) = hold_peak(&self.peaks, self.carrier) {
-                self.carrier = CARRIER_SMOOTH * self.carrier + (1.0 - CARRIER_SMOOTH) * f;
-                self.coast = 0;
-                self.cand = None;
-                return;
-            }
-            self.coast += 1;
-            // Catch a retune fast: a far, strong line confirming over a few
-            // blocks re-anchors without waiting for the coast to run out.
-            if let Some((f, m)) = self.peaks.first().copied() {
-                if m >= ACQUIRE_MARGIN && (f - self.carrier).abs() > TRACK_SEARCH_HZ {
-                    let cnt = match self.cand {
-                        Some((cf, c)) if (f - cf).abs() <= TRACK_SEARCH_HZ => c + 1,
-                        _ => 1,
-                    };
-                    if cnt >= ACQUIRE_CONFIRM || m >= FAST_LOCK_MARGIN {
-                        if (f - self.last_lock).abs() > SEGMENT_JUMP_HZ {
-                            self.dec = None;
-                        }
-                        self.carrier = f;
-                        self.last_lock = f;
-                        self.coast = 0;
-                        self.cand = None;
-                    } else {
-                        self.cand = Some((f, cnt));
-                    }
-                } else {
-                    self.cand = None;
-                }
-            }
-            if self.coast > COAST_MAX {
-                self.locked = false;
-                self.cand = None;
-            }
-            return;
-        }
-
-        // SEARCH: confirm the strongest line over several blocks before locking.
-        let strongest = self.peaks.first().copied();
-        match strongest {
-            Some((f, m)) if m >= ACQUIRE_MARGIN => {
-                let cnt = match self.cand {
-                    Some((cf, c)) if (f - cf).abs() <= TRACK_SEARCH_HZ => c + 1,
-                    _ => 1,
-                };
-                if cnt >= ACQUIRE_CONFIRM || m >= FAST_LOCK_MARGIN {
-                    if self.ever && (f - self.last_lock).abs() > SEGMENT_JUMP_HZ {
-                        self.dec = None; // retune: fresh decoder
-                    }
-                    self.carrier = f;
-                    self.last_lock = f;
-                    self.ever = true;
-                    self.locked = true;
-                    self.coast = 0;
-                    self.cand = None;
-                } else {
-                    self.cand = Some((f, cnt));
-                }
-            }
-            _ => self.cand = None,
-        }
-    }
-
-    /// Mix the block to 0 Hz (phase-continuous), resample to 48 kHz and feed the
-    /// C decoder, collecting any frames it emits.
-    fn mix_and_feed(&mut self, block: &[Complex32]) {
-        let two_pi = 2.0 * std::f64::consts::PI;
-        let w = -two_pi * self.carrier as f64 / self.fs as f64;
-        self.mixed.clear();
-        self.mixed.reserve(block.len());
-        for &z in block {
-            self.mix_phase = (self.mix_phase + w).rem_euclid(two_pi);
-            let (s, c) = self.mix_phase.sin_cos();
-            let (s, c) = (s as f32, c as f32);
-            self.mixed
-                .push(Complex32::new(z.re * c - z.im * s, z.re * s + z.im * c));
-        }
-
-        self.resout.clear();
-        self.resampler.process(&self.mixed, &mut self.resout);
-
-        self.ilv.clear();
-        self.ilv.reserve(self.resout.len() * 2);
-        for c in &self.resout {
-            self.ilv.push(c.re);
-            self.ilv.push(c.im);
-        }
-
-        let dec = self
-            .dec
-            .get_or_insert_with(|| Decoder::new().expect("decoder alloc"));
-        dec.feed_iq(&self.ilv);
-        while let Some(f) = dec.poll() {
-            if self.seen.insert(f.data.clone()) {
-                if std::env::var_os("OPENHOSHIMI_SM_TRAJ").is_some() {
-                    eprintln!(
-                        "frame @blk~{}s carrier={:+.0}Hz seq={:02X}",
-                        self.blk, self.carrier, f.data[2]
-                    );
-                }
-                self.frames.push(f);
-            }
-        }
-    }
+    frames
 }
 
 /// Decode ASRTU-1 CCSDS frames from full-pass IQ via the soundmodem C backend.
 ///
-/// A thin offline wrapper over [`StreamDecoder`]: the whole recording is pushed
-/// through the same causal pipeline a live source would drive.
+/// Offline three-stage pipeline: survey the `s^2` carrier every second, fit
+/// smooth Doppler tracks through the confident detections (RANSAC, constrained
+/// by physics), then replay each track through its own decoder in parallel.
+/// There is no acquisition threshold — the RS code alone judges a real frame.
 pub fn decode_iq(iq: &[IqSample], fs: u32) -> Vec<Frame> {
+    use rayon::prelude::*;
     if iq.is_empty() {
         return Vec::new();
     }
-    let mut sd = StreamDecoder::new(fs);
-    let mut buf: Vec<Complex32> = Vec::with_capacity(fs as usize);
-    for s in iq {
-        buf.push(Complex32::new(s.i, s.q));
-        if buf.len() == fs as usize {
-            sd.push(&buf);
-            buf.clear();
-        }
-    }
-    sd.push(&buf);
-    sd.finish();
-    sd.take_frames()
+    let cplx: Vec<Complex32> = iq.iter().map(|s| Complex32::new(s.i, s.q)).collect();
+    let sv = survey(&cplx, fs);
+    let anchors: Vec<(f32, f32)> = sv
+        .iter()
+        .enumerate()
+        .filter(|(_, &(_, m))| m >= ANCHOR_MARGIN)
+        .map(|(b, &(f, _))| (b as f32, f))
+        .collect();
+    let tracks = ransac_tracks(&anchors);
+
+    // Replay every candidate track in parallel: distinct Doppler curves de-rotate
+    // differently and catch different frames, so they are not interchangeable.
+    let mut all: Vec<Frame> = tracks
+        .par_iter()
+        .flat_map(|tr| replay(&cplx, fs, tr))
+        .collect();
+
+    let mut seen = HashSet::new();
+    all.retain(|f| seen.insert(f.data.clone()));
+    all
 }
