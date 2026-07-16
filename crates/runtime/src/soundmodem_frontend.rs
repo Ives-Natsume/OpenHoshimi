@@ -202,10 +202,6 @@ const INLIER_TOL_HZ: f32 = 1500.0;
 const REPLAY_PREROLL_S: f32 = 2.0;
 const REPLAY_POSTROLL_S: f32 = 15.0;
 
-/// Anchor windows closer than this merge into one replay span (keeps a
-/// near-continuous signal whole); bursts farther apart stay separate.
-const MERGE_GAP_S: f32 = 30.0;
-
 /// Min anchors on a track for it to be worth replaying. Two is enough: a weak
 /// burst may seed only two anchors yet still decode once de-rotated, so the RS
 /// code, not this, is the real filter.
@@ -304,67 +300,75 @@ fn ransac_tracks(anchors: &[(f32, f32)]) -> Vec<Track> {
     tracks
 }
 
-/// Replay one Doppler track: over each anchor-centred window (quiet gaps between
-/// bursts skipped), mix to 0 Hz along the fitted carrier curve, resample to
-/// 48 kHz and decode. RS is the sole arbiter.
-fn replay(cplx: &[Complex32], fs: u32, tr: &Track) -> Vec<Frame> {
-    // Merge the padded windows around each anchor into disjoint sample spans.
+/// Sample spans to decode for a track: touching-merged windows around each
+/// anchor (a fresh decoder per burst re-acquires after a quiet gap) plus, when
+/// there are gaps, the full extent as one continuous span. Their union never
+/// loses frames versus either alone. Window width (hence merging) is fixed by
+/// the roll constants, so there is no accuracy knob here.
+fn track_spans(tr: &Track, fs: u32, len: usize) -> Vec<(usize, usize)> {
     let mut wins: Vec<(usize, usize)> = tr
         .ats
         .iter()
         .map(|&a| {
             let s0 = ((a - REPLAY_PREROLL_S).max(0.0) * fs as f32) as usize;
-            let s1 = (((a + 1.0 + REPLAY_POSTROLL_S) * fs as f32) as usize).min(cplx.len());
+            let s1 = (((a + 1.0 + REPLAY_POSTROLL_S) * fs as f32) as usize).min(len);
             (s0, s1)
         })
         .collect();
-    // Merge windows separated by less than a burst gap so a near-continuous
-    // signal decodes as one span (no boundary losses), while bursts tens of
-    // seconds apart stay separate and each re-acquires with a fresh decoder.
-    let merge_gap = (MERGE_GAP_S * fs as f32) as usize;
     wins.sort_unstable();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     for (s0, s1) in wins {
         match spans.last_mut() {
-            Some(last) if s0 <= last.1 + merge_gap => last.1 = last.1.max(s1),
+            Some(last) if s0 <= last.1 => last.1 = last.1.max(s1),
             _ => spans.push((s0, s1)),
         }
     }
+    // Also decode the full continuous extent, so a signal that fades in and out
+    // across gaps is still decoded whole. Union with the per-burst windows never
+    // loses frames versus either alone; it only costs the extra continuous decode
+    // — the price of maximising decode rate without any accuracy knob.
+    if spans.len() > 1 {
+        let (lo, hi) = (spans[0].0, spans.last().unwrap().1);
+        spans.push((lo, hi));
+    }
+    spans
+}
 
+/// Decode one span: mix to 0 Hz along carrier(t) = a + b*t, resample to 48 kHz
+/// and run the C decoder. RS is the sole arbiter.
+fn decode_span(cplx: &[Complex32], fs: u32, s0: usize, s1: usize, a: f32, b: f32) -> Vec<Frame> {
+    if s1 <= s0 {
+        return Vec::new();
+    }
     let two_pi = 2.0 * std::f64::consts::PI;
-    let mut frames = Vec::new();
-    for (s0, s1) in spans {
-        if s1 <= s0 {
-            continue;
-        }
-        let mut phase = 0.0f64;
-        let mixed: Vec<Complex32> = cplx[s0..s1]
-            .iter()
-            .enumerate()
-            .map(|(i, z)| {
-                let t = (s0 + i) as f32 / fs as f32;
-                let fc = tr.a + tr.b * t;
-                phase = (phase - two_pi * fc as f64 / fs as f64).rem_euclid(two_pi);
-                let (s, c) = phase.sin_cos();
-                let (s, c) = (s as f32, c as f32);
-                Complex32::new(z.re * c - z.im * s, z.re * s + z.im * c)
-            })
-            .collect();
+    let mut phase = 0.0f64;
+    let mixed: Vec<Complex32> = cplx[s0..s1]
+        .iter()
+        .enumerate()
+        .map(|(i, z)| {
+            let t = (s0 + i) as f32 / fs as f32;
+            let fc = a + b * t;
+            phase = (phase - two_pi * fc as f64 / fs as f64).rem_euclid(two_pi);
+            let (s, c) = phase.sin_cos();
+            let (s, c) = (s as f32, c as f32);
+            Complex32::new(z.re * c - z.im * s, z.re * s + z.im * c)
+        })
+        .collect();
 
-        let mut rs = StreamResampler::new(fs, SAMPLE_RATE);
-        let mut res = Vec::new();
-        rs.process(&mixed, &mut res);
-        let mut ilv = Vec::with_capacity(res.len() * 2);
-        for c in &res {
-            ilv.push(c.re);
-            ilv.push(c.im);
-        }
-        if let Some(mut dec) = Decoder::new() {
-            dec.feed_iq(&ilv);
-            dec.flush();
-            while let Some(f) = dec.poll() {
-                frames.push(f);
-            }
+    let mut rs = StreamResampler::new(fs, SAMPLE_RATE);
+    let mut res = Vec::new();
+    rs.process(&mixed, &mut res);
+    let mut ilv = Vec::with_capacity(res.len() * 2);
+    for c in &res {
+        ilv.push(c.re);
+        ilv.push(c.im);
+    }
+    let mut frames = Vec::new();
+    if let Some(mut dec) = Decoder::new() {
+        dec.feed_iq(&ilv);
+        dec.flush();
+        while let Some(f) = dec.poll() {
+            frames.push(f);
         }
     }
     frames
@@ -391,11 +395,21 @@ pub fn decode_iq(iq: &[IqSample], fs: u32) -> Vec<Frame> {
         .collect();
     let tracks = ransac_tracks(&anchors);
 
-    // Replay every candidate track in parallel: distinct Doppler curves de-rotate
-    // differently and catch different frames, so they are not interchangeable.
-    let mut all: Vec<Frame> = tracks
+    // Flatten every track's spans into one job list and decode them all in
+    // parallel, so a single dominant track's spans still use every core.
+    let jobs: Vec<(usize, usize, f32, f32)> = tracks
+        .iter()
+        .flat_map(|tr| {
+            let (a, b) = (tr.a, tr.b);
+            track_spans(tr, fs, cplx.len())
+                .into_iter()
+                .map(move |(s0, s1)| (s0, s1, a, b))
+        })
+        .collect();
+
+    let mut all: Vec<Frame> = jobs
         .par_iter()
-        .flat_map(|tr| replay(&cplx, fs, tr))
+        .flat_map(|&(s0, s1, a, b)| decode_span(&cplx, fs, s0, s1, a, b))
         .collect();
 
     let mut seen = HashSet::new();
