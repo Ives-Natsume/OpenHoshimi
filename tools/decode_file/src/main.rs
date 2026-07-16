@@ -1,5 +1,6 @@
 //! Offline file decoding tool for ClosedHoshimi.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -116,18 +117,79 @@ fn run_soundmodem(input: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Print soundmodem frames as `#NNN corrected=C  <full 223-byte hex payload>`.
+/// Print soundmodem frames: a header line per frame followed by a classic
+/// `hexdump -C`-style body (offset, two 8-byte hex groups, ASCII sidebar),
+/// coloured when stdout is a terminal and left plain when piped.
 fn print_sm_frames(frames: &[openhoshimi_soundmodem::Frame]) {
+    let color = std::io::stdout().is_terminal();
     for (i, f) in frames.iter().enumerate() {
-        let hex: String = f.data.iter().map(|b| format!("{b:02x} ")).collect();
+        let seq = f.data.get(2).copied().unwrap_or(0);
         println!(
-            "#{:03} corrected={:<3}  {}",
+            "#{:03}  seq={seq:02X}  corrected={}  {} bytes",
             i + 1,
             f.corrected,
-            hex.trim_end()
+            f.data.len()
         );
+        hexdump(&f.data, color);
     }
     eprintln!("decode_file: soundmodem decoded {} frame(s)", frames.len());
+}
+
+/// Render `data` as a coloured `hexdump -C`-style block. Zero bytes are dim,
+/// printable ASCII green, other bytes cyan; the ASCII column mirrors this.
+fn hexdump(data: &[u8], color: bool) {
+    const DIM: &str = "\x1b[38;5;242m";
+    const GRN: &str = "\x1b[32m";
+    const CYN: &str = "\x1b[36m";
+    const RST: &str = "\x1b[0m";
+    let printable = |b: u8| (0x20..=0x7e).contains(&b);
+
+    for (row, chunk) in data.chunks(16).enumerate() {
+        let mut line = String::new();
+        let off = format!("{:04x}", row * 16);
+        if color {
+            line.push_str(&format!("  {DIM}{off}{RST}  "));
+        } else {
+            line.push_str(&format!("  {off}  "));
+        }
+        for j in 0..16 {
+            if j == 8 {
+                line.push(' ');
+            }
+            match chunk.get(j) {
+                Some(&b) => {
+                    let cell = format!("{b:02x} ");
+                    if !color {
+                        line.push_str(&cell);
+                    } else if b == 0 {
+                        line.push_str(&format!("{DIM}{cell}{RST}"));
+                    } else if printable(b) {
+                        line.push_str(&format!("{GRN}{cell}{RST}"));
+                    } else {
+                        line.push_str(&format!("{CYN}{cell}{RST}"));
+                    }
+                }
+                None => line.push_str("   "),
+            }
+        }
+        line.push_str(" |");
+        for &b in chunk {
+            if printable(b) {
+                let ch = (b as char).to_string();
+                if color {
+                    line.push_str(&format!("{GRN}{ch}{RST}"));
+                } else {
+                    line.push_str(&ch);
+                }
+            } else if color {
+                line.push_str(&format!("{DIM}.{RST}"));
+            } else {
+                line.push('.');
+            }
+        }
+        line.push('|');
+        println!("{line}");
+    }
 }
 
 /// Feed a 48 kHz mono 12 kHz-IF WAV straight into the soundmodem C decoder,
