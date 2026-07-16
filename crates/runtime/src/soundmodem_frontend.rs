@@ -42,10 +42,6 @@ const TRACK_SEARCH_HZ: f32 = 4000.0;
 /// Half-width, in output taps, of the resampler's anti-alias prototype.
 const RESAMPLE_HALF_SPAN: usize = 10;
 
-/// Carrier step (Hz) above which a new lock is treated as a retune, resetting
-/// the decoder rather than forcing its loops to survive a large jump.
-const SEGMENT_JUMP_HZ: f32 = 8000.0;
-
 /// `s^2` margin a peak must clear to keep the lock. Below this the block is
 /// treated as a fade and the tracker coasts on the last carrier rather than
 /// chasing an FM/noise peak (margin ~10-15) off the true Doppler line.
@@ -53,11 +49,11 @@ const HOLD_MARGIN: f32 = 20.0;
 
 /// `s^2` margin a candidate must clear to acquire the lock. Real emitters run in
 /// the hundreds; FM splatter false peaks sit around 10-15, so this rejects them.
-const ACQUIRE_MARGIN: f32 = 20.0;
+const ACQUIRE_MARGIN: f32 = 12.0;
 
 /// Consecutive blocks a candidate line must persist before the tracker locks
 /// onto it, so a one-off spike cannot pull the carrier.
-const ACQUIRE_CONFIRM: usize = 3;
+const ACQUIRE_CONFIRM: usize = 2;
 
 /// `s^2` margin so high the line is unambiguously the signal (FM splatter tops
 /// out ~15); the tracker locks on it in one block, not losing the leading
@@ -73,6 +69,10 @@ const COAST_MAX: usize = 30;
 /// IIR weight damping per-block `s^2` jitter on the tracked carrier into phase
 /// noise; a fresh lock sets the carrier directly, bypassing this.
 const CARRIER_SMOOTH: f32 = 0.5;
+
+/// Carrier step (Hz) above which a new lock is treated as a retune, resetting
+/// the decoder rather than forcing its loops to survive a large jump.
+const SEGMENT_JUMP_HZ: f32 = 8000.0;
 
 fn gcd(mut a: usize, mut b: usize) -> usize {
     while b != 0 {
@@ -262,6 +262,7 @@ pub struct StreamDecoder {
 
     frames: Vec<Frame>,
     seen: HashSet<Vec<u8>>,
+    blk: usize,
 }
 
 impl StreamDecoder {
@@ -292,6 +293,7 @@ impl StreamDecoder {
             ilv: Vec::new(),
             frames: Vec::new(),
             seen: HashSet::new(),
+            blk: 0,
         }
     }
 
@@ -337,6 +339,7 @@ impl StreamDecoder {
 
     fn process_block(&mut self, block: &[Complex32]) {
         if block.len() == self.block_len {
+            self.blk += 1;
             self.update_tracking(block);
         }
         if self.locked {
@@ -450,6 +453,12 @@ impl StreamDecoder {
         dec.feed_iq(&self.ilv);
         while let Some(f) = dec.poll() {
             if self.seen.insert(f.data.clone()) {
+                if std::env::var_os("OPENHOSHIMI_SM_TRAJ").is_some() {
+                    eprintln!(
+                        "frame @blk~{}s carrier={:+.0}Hz seq={:02X}",
+                        self.blk, self.carrier, f.data[2]
+                    );
+                }
                 self.frames.push(f);
             }
         }
