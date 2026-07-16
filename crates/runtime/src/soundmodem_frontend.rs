@@ -104,7 +104,6 @@ fn block_peaks(
     }
 }
 
-
 /// Stateful rational polyphase resampler (upfirdn) for a streaming complex
 /// signal: `out_rate = in_rate * l / m`. Carries filter history across calls so
 /// block boundaries introduce no transient.
@@ -233,7 +232,14 @@ fn survey(cplx: &[Complex32], fs: u32) -> Vec<(f32, f32)> {
     let mut peaks = Vec::new();
     let mut out = Vec::with_capacity(nblocks);
     for b in 0..nblocks {
-        block_peaks(&cplx[b * block..(b + 1) * block], fs, &fft, &mut buf, &mut mag, &mut peaks);
+        block_peaks(
+            &cplx[b * block..(b + 1) * block],
+            fs,
+            &fft,
+            &mut buf,
+            &mut mag,
+            &mut peaks,
+        );
         out.push(peaks.first().copied().unwrap_or((0.0, 0.0)));
     }
     out
@@ -285,7 +291,11 @@ fn ransac_tracks(anchors: &[(f32, f32)]) -> Vec<Track> {
         if cnt < 2 {
             break;
         }
-        let inl: Vec<(f32, f32)> = rem.iter().copied().filter(|&(t, f)| on_line(a, b, t, f)).collect();
+        let inl: Vec<(f32, f32)> = rem
+            .iter()
+            .copied()
+            .filter(|&(t, f)| on_line(a, b, t, f))
+            .collect();
         rem.retain(|&(t, f)| !on_line(a, b, t, f));
         if cnt < MIN_INLIERS {
             continue;
