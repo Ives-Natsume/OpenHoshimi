@@ -43,6 +43,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            clang \
             libasound2-dev \
             libgtk-3-dev \
             libxcb-render0-dev \
@@ -54,6 +55,20 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: ASRTU-1 telemetry tables
+        # Guard the hand-maintained tables: the generator must still reproduce
+        # tm_tables.c from the sheets, and both C checks (a synthetic self-test
+        # and an independent re-parse that cross-checks every field) must pass.
+        run: |
+          cd soundmodem
+          python3 tools/gen_tm_tables.py ASRTU-1 > /tmp/tm_tables.gen.c
+          diff -u csrc/tm_tables.c /tmp/tm_tables.gen.c
+          clang -std=c99 -Wall -Wextra -Werror -Icsrc \
+            csrc/tm_decode.c csrc/tm_tables.c test/tm_selftest.c -lm -o /tmp/tm_selftest
+          clang -std=c99 -Wall -Wextra -Werror -Icsrc \
+            csrc/tm_decode.c csrc/tm_tables.c test/tm_verify.c -lm -o /tmp/tm_verify
+          /tmp/tm_selftest
+          /tmp/tm_verify ASRTU-1
 
   test-windows:
     name: Test (Windows)
