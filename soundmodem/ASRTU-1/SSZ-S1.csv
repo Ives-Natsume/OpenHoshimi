@@ -1,0 +1,25 @@
+full_code_name,保留,chinese_code_name,function,english_code_name
+SSZ-C10000.7.8,0000.7.8,遥测主类型,F={UX|B6H(星敏感器Z)},Telemetry Main Type
+SSZ-C10001.7.8,0001.7.8,遥测副类型,F={UX|01H(第1类遥测)},Telemetry Sub Type
+SSZ-C10002.7.32,0002.7.32,OBC时间累计秒整数,F=X<s>,OBC Time Accumulated Seconds Integer
+SSZ-C10006.7.16,0006.7.16,OBC时间秒小数,F=X<s>,OBC Time Seconds Fraction
+SSZ-C10008.7.32,0008.7.32,UTC时间累计秒,F=X<s>,UTC Time Accumulated Seconds
+SSZ-C10012.7.16,0012.7.16,指令类型,F=HX<s>,Command Type
+SSZ-C10014.7.8,0014.7.8,成像器件温度,F=HX<℃>,Imaging Device Temperature
+SSZ-C10015.7.8,0015.7.8,成像器件工作状态,"F={UX|1H(异常),0H(正常)}",Imaging Device Operating Status
+SSZ-C10015.6.1,0015.6.1,SRAM状态,"F={UX|1H(异常),0H(正常)}",SRAM Status
+SSZ-C10015.5.1,0015.5.1,FLASH状态,"F={UX|1H(异常),0H(正常)}",FLASH Status
+SSZ-C10015.4.1,0015.4.1,管理程序完整性,"F={UX|1H(异常),0H(正常)}",Management Program Integrity
+SSZ-C10015.3.1,0015.3.1,导航星库完整性,"F={UX|1H(异常),0H(正常)}",Navigation Star Catalog Integrity
+SSZ-C10015.2.1,0015.2.1,应用程序镜像1完整性,"F={UX|1H(异常),0H(正常)}",Application Program Image 1 Integrity
+SSZ-C10015.1.1,0015.1.1,应用程序镜像2完整性,"F={UX|1H(异常),0H(正常)}",Application Program Image 2 Integrity
+SSZ-C10015.0.1,0015.0.1,应用程序镜像3完整性,"F={UX|1H(异常),0H(正常)}",Application Program Image 3 Integrity
+SSZ-C10016.7.1,0016.7.1,应用程序镜像4完整性,"F={UX|1H(异常),0H(正常)}",Application Program Image 4 Integrity
+SSZ-C10016.6.1,0016.6.1,应用程序镜像5完整性,"F={UX|1H(异常),0H(正常)}",Application Program Image 5 Integrity
+SSZ-C10016.5.1,0016.5.1,保留,F=X,Reserved
+SSZ-C10016.4.1,0016.4.1,保留,F=X,Reserved
+SSZ-C10016.3.1,0016.3.1,保留,F=X,Reserved
+SSZ-C10016.2.1,0016.2.1,保留,F=X,Reserved
+SSZ-C10016.1.1,0016.1.1,保留,F=X,Reserved
+SSZ-C10016.0.1,0016.0.1,保留,F=X,Reserved
+SSZ-C10017.7.8,0017.7.8,帧尾,F=HX,Frame Tail

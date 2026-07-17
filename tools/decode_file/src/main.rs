@@ -62,6 +62,11 @@ struct Args {
     /// versus decoder behaviour.
     #[arg(long)]
     soundmodem_raw: bool,
+    /// Where to write the full ASRTU-1 telemetry report (every packet, hex
+    /// dump plus all fields). Defaults to `<input>.telemetry.txt`. The console
+    /// shows only a one-line-per-packet summary to stay readable.
+    #[arg(long)]
+    tlm_out: Option<PathBuf>,
 }
 
 /// How the input file should be interpreted.
@@ -89,7 +94,7 @@ fn main() -> ExitCode {
 
 /// Decode ASRTU-1 via the vendored soundmodem C backend: slurp the input as
 /// stereo IQ and hand it to the windowed front-end, printing each frame.
-fn run_soundmodem(input: &Path) -> Result<(), String> {
+fn run_soundmodem(input: &Path, tlm_out: Option<&Path>) -> Result<(), String> {
     let mut source =
         WavIqSource::open(input).map_err(|err| format!("failed to open IQ WAV: {err}"))?;
     let fs = source.sample_rate();
@@ -113,15 +118,18 @@ fn run_soundmodem(input: &Path) -> Result<(), String> {
     );
 
     let frames = openhoshimi_runtime::soundmodem_frontend::decode_iq(&iq, fs);
-    print_sm_frames(&frames);
+    print_sm_frames(&frames, input, tlm_out);
     Ok(())
 }
 
 /// Print soundmodem frames: a header line per frame followed by a classic
 /// `hexdump -C`-style body (offset, two 8-byte hex groups, ASCII sidebar),
 /// coloured when stdout is a terminal and left plain when piped.
-fn print_sm_frames(frames: &[openhoshimi_soundmodem::Frame]) {
+fn print_sm_frames(frames: &[openhoshimi_soundmodem::Frame], input: &Path, tlm_out: Option<&Path>) {
     let color = std::io::stdout().is_terminal();
+    // Stateful decoder so each frame's telemetry prints directly beneath it
+    // (packets straddle frames, so it carries reassembly state across feeds).
+    let mut tlm = openhoshimi_soundmodem::TelemetryDecoder::new();
     for (i, f) in frames.iter().enumerate() {
         let seq = f.data.get(2).copied().unwrap_or(0);
         println!(
@@ -131,8 +139,25 @@ fn print_sm_frames(frames: &[openhoshimi_soundmodem::Frame]) {
             f.data.len()
         );
         hexdump(&f.data, color);
+        if let Some(dec) = tlm.as_mut() {
+            print!("{}", dec.feed(&f.data, color, false));
+        }
     }
     eprintln!("decode_file: soundmodem decoded {} frame(s)", frames.len());
+
+    // The full report (every packet, hex dump + all fields) goes to a file;
+    // the console kept only the per-frame summaries above.
+    let full = openhoshimi_soundmodem::decode_telemetry(frames, false, true);
+    if full.is_empty() {
+        return;
+    }
+    let path = tlm_out
+        .map(PathBuf::from)
+        .unwrap_or_else(|| input.with_extension("telemetry.txt"));
+    match std::fs::write(&path, full) {
+        Ok(()) => println!("decode_file: full telemetry saved to {}", path.display()),
+        Err(err) => eprintln!("decode_file: could not write {}: {err}", path.display()),
+    }
 }
 
 /// Render `data` as a coloured `hexdump -C`-style block. Zero bytes are dim,
@@ -194,7 +219,7 @@ fn hexdump(data: &[u8], color: bool) {
 
 /// Feed a 48 kHz mono 12 kHz-IF WAV straight into the soundmodem C decoder,
 /// bypassing the IQ front-end (the official soundmodem input format).
-fn run_soundmodem_raw(input: &Path) -> Result<(), String> {
+fn run_soundmodem_raw(input: &Path, tlm_out: Option<&Path>) -> Result<(), String> {
     let mut source = open_audio_source(input)?;
     let fs = source.sample_rate();
     if fs != openhoshimi_soundmodem::SAMPLE_RATE {
@@ -221,17 +246,17 @@ fn run_soundmodem_raw(input: &Path) -> Result<(), String> {
     while let Some(f) = dec.poll() {
         frames.push(f);
     }
-    print_sm_frames(&frames);
+    print_sm_frames(&frames, input, tlm_out);
     Ok(())
 }
 
 fn run() -> Result<(), String> {
     let args = Args::parse();
     if args.soundmodem_raw {
-        return run_soundmodem_raw(&args.input_wav);
+        return run_soundmodem_raw(&args.input_wav, args.tlm_out.as_deref());
     }
     if args.soundmodem {
-        return run_soundmodem(&args.input_wav);
+        return run_soundmodem(&args.input_wav, args.tlm_out.as_deref());
     }
     if let Some(path) = std::env::var_os("OPENHOSHIMI_SYMBOL_DUMP") {
         open_symbol_dump(Path::new(&path))

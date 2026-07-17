@@ -1,0 +1,13 @@
+full_code_name,保留,chinese_code_name,function,english_code_name 
+TTC-C20000.7.8,id_0,id_0,F=HX,id_0
+TTC-C20001.7.8,id_1,id_1,F=HX,id_1
+TTC-C20002.7.8,adf7021_ld,ADF7021锁定检测,F=HX,adf7021_ld
+TTC-C20003.7.8,err_flag,错误标识,F=HX,err_flag
+TTC-C20004.7.32,agc_reg,AGC寄存器,F=HX,agc_reg
+TTC-C20008.7.16,n_tx_232,232发送计数,F=UX,n_tx_232
+TTC-C200010.7.16,n_rx_232,232接收计数,F=UX,n_tx_232
+TTC-C200012.7.32,runtime,运行时间,F=UX,runtime
+TTC-C200016.7.16,rssi_analog,模拟RSSI,F=HX,rssi_analog
+TTC-C200018.7.8,unlock_count,失锁计数,F=UX,unlock_count
+TTC-C200019.7.8,reset_flag,复位标识,F=HX,reset_flag
+TTC-C200020.7.32,reset_count,复位计数,F=UX,reset_count

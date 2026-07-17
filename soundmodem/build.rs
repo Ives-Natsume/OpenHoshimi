@@ -23,6 +23,8 @@ fn main() {
         .warnings(false)
         .file("csrc/smdsp.c")
         .file("csrc/sm_api.c")
+        .file("csrc/tm_decode.c")
+        .file("csrc/tm_tables.c")
         .file("vendor/ccsds.c")
         .file("vendor/viterbi27.c")
         .file("vendor/rs.c")

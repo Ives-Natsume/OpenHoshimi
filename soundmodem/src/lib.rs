@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use std::os::raw::c_int;
+use std::os::raw::{c_char, c_int};
 
 /// Payload length of one decoded CCSDS frame (RS(255,223) message).
 pub const FRAME_LEN: usize = 223;
@@ -32,6 +32,30 @@ extern "C" {
     fn sm_decoder_feed_iq(dec: *mut SmDecoder, iq: *const f32, n: usize);
     fn sm_decoder_flush(dec: *mut SmDecoder);
     fn sm_decoder_poll(dec: *mut SmDecoder, out: *mut u8, corrected: *mut c_int) -> c_int;
+    fn tm_decode_frames(
+        frames: *const u8,
+        nframes: usize,
+        out: *mut c_char,
+        cap: usize,
+        color: c_int,
+        full: c_int,
+    ) -> c_int;
+    fn tm_decoder_open() -> *mut TmDecoder;
+    fn tm_decoder_close(dec: *mut TmDecoder);
+    fn tm_decoder_feed(
+        dec: *mut TmDecoder,
+        frame: *const u8,
+        out: *mut c_char,
+        cap: usize,
+        color: c_int,
+        full: c_int,
+    ) -> c_int;
+}
+
+/// Opaque handle to a stateful telemetry decoder; never dereferenced in Rust.
+#[repr(C)]
+struct TmDecoder {
+    _private: [u8; 0],
 }
 
 /// A decoded CCSDS frame and its Reed-Solomon correction count.
@@ -118,6 +142,104 @@ impl Decoder {
         frames
     }
 }
+
+/// Decode ASRTU-1 telemetry packets from a run of decoded CCSDS frames into a
+/// human-readable report. Frames must be in receive order: the 223-byte frames
+/// carry a KISS-framed packet stream, and a packet body may straddle two
+/// frames. Frames whose length is not [`FRAME_LEN`] are skipped. When `color`
+/// is true the report carries ANSI colour (field-coloured hex dump and value
+/// highlighting); pass false when the sink is not a terminal. When `full` is
+/// true each packet is rendered in detail (hex dump + fields); when false only
+/// a one-line summary per packet is produced.
+pub fn decode_telemetry(frames: &[Frame], color: bool, full: bool) -> String {
+    let mut flat = Vec::with_capacity(frames.len() * FRAME_LEN);
+    for f in frames {
+        if f.data.len() == FRAME_LEN {
+            flat.extend_from_slice(&f.data);
+        }
+    }
+    let nframes = flat.len() / FRAME_LEN;
+    if nframes == 0 {
+        return String::new();
+    }
+    // The C side renders a bounded amount of text per field plus a coloured hex
+    // dump; size the output buffer generously per frame and let C truncate.
+    let cap = nframes * 48 * 1024 + 8192;
+    let mut out = vec![0u8; cap];
+    // SAFETY: flat holds nframes*FRAME_LEN bytes; out has cap bytes; the C side
+    // writes a NUL-terminated string within cap.
+    unsafe {
+        tm_decode_frames(
+            flat.as_ptr(),
+            nframes,
+            out.as_mut_ptr() as *mut c_char,
+            cap,
+            c_int::from(color),
+            c_int::from(full),
+        );
+    }
+    let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
+    String::from_utf8_lossy(&out[..end]).into_owned()
+}
+
+/// Stateful telemetry decoder: feed frames one at a time (in receive order)
+/// and render the telemetry each frame completes, so a caller printing frames
+/// can show the decode directly beneath each one. KISS reassembly state (for
+/// packets that straddle frames) is carried across feeds.
+pub struct TelemetryDecoder {
+    raw: *mut TmDecoder,
+}
+
+impl TelemetryDecoder {
+    /// Allocate a decoder, or `None` on allocation failure.
+    pub fn new() -> Option<Self> {
+        // SAFETY: tm_decoder_open returns an owned pointer or null.
+        let raw = unsafe { tm_decoder_open() };
+        if raw.is_null() {
+            None
+        } else {
+            Some(Self { raw })
+        }
+    }
+
+    /// Feed one 223-byte frame and return the rendered telemetry for the
+    /// packets that completed within it (empty when none). `color` emits ANSI;
+    /// `full` selects the detailed render over the one-line summary. Frames not
+    /// exactly [`FRAME_LEN`] bytes are ignored.
+    pub fn feed(&mut self, frame: &[u8], color: bool, full: bool) -> String {
+        if frame.len() != FRAME_LEN {
+            return String::new();
+        }
+        // One frame completes at most a few packets; size the buffer for the
+        // detailed render and let C truncate.
+        let mut out = vec![0u8; 256 * 1024];
+        let cap = out.len();
+        // SAFETY: raw is a valid handle; frame is FRAME_LEN bytes; out has cap
+        // bytes and the C side writes a NUL-terminated string within it.
+        unsafe {
+            tm_decoder_feed(
+                self.raw,
+                frame.as_ptr(),
+                out.as_mut_ptr() as *mut c_char,
+                cap,
+                c_int::from(color),
+                c_int::from(full),
+            );
+        }
+        let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
+        String::from_utf8_lossy(&out[..end]).into_owned()
+    }
+}
+
+impl Drop for TelemetryDecoder {
+    fn drop(&mut self) {
+        // SAFETY: raw came from tm_decoder_open and is freed exactly once.
+        unsafe { tm_decoder_close(self.raw) }
+    }
+}
+
+// The decoder owns its reassembly state behind the handle and shares nothing.
+unsafe impl Send for TelemetryDecoder {}
 
 impl Drop for Decoder {
     fn drop(&mut self) {

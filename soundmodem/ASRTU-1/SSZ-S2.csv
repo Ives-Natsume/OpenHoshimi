@@ -1,0 +1,9 @@
+full_code_name,保留,chinese_code_name,function,english_code_name
+SSZ-C20000.7.8,0000.7.8,遥测主类型,F={UX|B6H(星敏感器Z)},Telemetry Main Type
+SSZ-C20001.7.8,0001.7.8,遥测副类型,F={UX|02H(第2类遥测)},Telemetry Sub Type
+SSZ-C20002.7.32,0002.7.32,OBC时间累计秒整数,F=X<s>,OBC Time Accumulated Seconds Integer
+SSZ-C20006.7.16,0006.7.16,OBC时间秒小数,F=X<s>,OBC Time Seconds Fraction
+SSZ-C20008.7.32,0008.7.32,UTC时间累计秒,F=X<s>,UTC Time Accumulated Seconds
+SSZ-C20012.7.16,0012.7.16,指令类型,F=HX<s>,Command Type
+SSZ-C20014.7.800,0014.7.800,调试用参数值,F=HX,Debug Parameter Value
+SSZ-C20114.7.8,0114.7.8,帧尾,F=HX,Frame Tail
