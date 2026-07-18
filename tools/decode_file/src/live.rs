@@ -20,6 +20,7 @@ use openhoshimi_core::{InputSource, IoError, IqSample, IqSource};
 use openhoshimi_io::{
     enumerate_input_devices, open_audio_source, SoundcardIqSource, SoundcardSource, WavIqSource,
 };
+use openhoshimi_runtime::soundmodem_frontend::StreamResampler;
 use openhoshimi_soundmodem::{DecodedField, Decoder, Frame, TelemetryDecoder, SAMPLE_RATE};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
@@ -45,6 +46,9 @@ const SPEC_ALPHA: f32 = 0.4;
 const FFT_PERIOD: Duration = Duration::from_millis(66);
 /// After this long with no fresh samples, the view flags "waiting for input".
 const STALL: Duration = Duration::from_secs(2);
+/// How many seconds of raw IQ to retain for the full decode pass on exit. Caps
+/// memory on a long session while covering a whole LEO pass.
+const ACCUM_SECS: usize = 900;
 
 type Cf = Complex<f32>;
 
@@ -122,14 +126,38 @@ impl Source {
     }
 }
 
-/// Entry point for `--live`. Runs the interactive session, then (terminal
-/// restored) prints the decoded frames as a coloured hex dump with a frame
-/// count and writes the full telemetry report, exactly like the batch path.
+/// Result handed back from the interactive session for the final decode.
+struct LiveResult {
+    /// Capture sample rate.
+    rate: u32,
+    /// Raw captured IQ (for a stereo source) to run the full offline pass over.
+    iq: Option<Vec<IqSample>>,
+    /// Frames the streaming path decoded live (used for a mono source, where
+    /// the offline IQ front-end does not apply).
+    streamed: Vec<Frame>,
+}
+
+/// Entry point for `--live`. Runs the interactive session; then, with the
+/// terminal restored, decodes the captured IQ with the full offline
+/// survey/replay pass (so the final yield matches `--soundmodem`, not just the
+/// causal live path) and prints the frames as a coloured hex dump plus the
+/// telemetry report, exactly like the batch path.
 pub fn run_live(opts: LiveOpts) -> Result<(), String> {
     let mut terminal = ratatui::try_init().map_err(|err| format!("terminal init failed: {err}"))?;
     let outcome = live_session(&mut terminal, &opts);
     ratatui::restore();
-    let frames = outcome?;
+    let result = outcome?;
+
+    let frames = match &result.iq {
+        Some(iq) if !iq.is_empty() => {
+            eprintln!(
+                "decode_file: full decode pass over {:.0}s of captured IQ...",
+                iq.len() as f32 / result.rate as f32
+            );
+            openhoshimi_runtime::soundmodem_frontend::decode_iq(iq, result.rate)
+        }
+        _ => result.streamed,
+    };
     let tlm_path = opts
         .tlm_out
         .clone()
@@ -141,7 +169,7 @@ pub fn run_live(opts: LiveOpts) -> Result<(), String> {
 fn live_session(
     terminal: &mut ratatui::DefaultTerminal,
     opts: &LiveOpts,
-) -> Result<Vec<Frame>, String> {
+) -> Result<LiveResult, String> {
     // A file source is paced to (scaled) real time so it plays like a pass; a
     // soundcard already arrives in real time.
     let (source, pace) = match &opts.file {
@@ -151,7 +179,14 @@ fn live_session(
                 Some(name) => name,
                 None => match pick_device(terminal)? {
                     Some(name) => name,
-                    None => return Ok(Vec::new()), // user cancelled the picker
+                    // User cancelled the picker: nothing captured.
+                    None => {
+                        return Ok(LiveResult {
+                            rate: 0,
+                            iq: None,
+                            streamed: Vec::new(),
+                        })
+                    }
                 },
             };
             (open_source(&device, opts.mono)?, false)
@@ -163,8 +198,17 @@ fn live_session(
 
     let shared = Arc::new(Mutex::new(Shared::default()));
     let frames = Arc::new(Mutex::new(Vec::<Frame>::new()));
+    let iq_log = Arc::new(Mutex::new(VecDeque::<IqSample>::new()));
+    let cap = (sample_rate as usize).saturating_mul(ACCUM_SECS);
     let pace_speed = if pace { Some(speed) } else { None };
-    let worker = spawn_worker(source, pace_speed, Arc::clone(&shared), Arc::clone(&frames));
+    let worker = spawn_worker(
+        source,
+        pace_speed,
+        cap,
+        Arc::clone(&shared),
+        Arc::clone(&frames),
+        Arc::clone(&iq_log),
+    );
 
     let started = Instant::now();
     let deadline = opts.seconds.map(|s| started + Duration::from_secs(s));
@@ -195,8 +239,22 @@ fn live_session(
     }
     let _ = worker.join();
 
-    let frames = frames.lock().map_err(|_| "frames lock poisoned")?;
-    Ok(frames.clone())
+    let streamed = frames.lock().map_err(|_| "frames lock poisoned")?.clone();
+    let iq = if opts.mono {
+        None
+    } else {
+        Some(
+            iq_log
+                .lock()
+                .map(|log| log.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        )
+    };
+    Ok(LiveResult {
+        rate: sample_rate,
+        iq,
+        streamed,
+    })
 }
 
 /// Interactive device picker. Returns the chosen device name, or `None` if the
@@ -289,8 +347,10 @@ fn open_from_file(path: &Path, mono: bool) -> Result<Source, String> {
 fn spawn_worker(
     source: Source,
     pace: Option<f32>,
+    iq_cap: usize,
     shared: Arc<Mutex<Shared>>,
     frames: Arc<Mutex<Vec<Frame>>>,
+    iq_log: Arc<Mutex<VecDeque<IqSample>>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut planner = FftPlanner::<f32>::new();
@@ -300,6 +360,10 @@ fn spawn_worker(
         let sample_rate = source.sample_rate();
         let mono = source.is_mono();
         let mut source = source;
+        // The decoder's timing is fixed at 48 kHz; resample anything else (e.g.
+        // a 44.1 kHz soundcard) before feeding it, or symbol timing never locks.
+        let mut resampler =
+            (sample_rate != SAMPLE_RATE).then(|| StreamResampler::new(sample_rate, SAMPLE_RATE));
 
         let mut window: VecDeque<Cf> = VecDeque::with_capacity(FFT_LEN);
         let mut smoothed: Vec<f32> = Vec::new();
@@ -326,6 +390,17 @@ fn spawn_worker(
                 thread::sleep(Duration::from_secs_f32(secs));
             }
 
+            // Retain raw IQ (bounded) so the exit pass can run the offline
+            // survey/replay decoder over the whole session.
+            if let Chunk::Iq(v) = &block {
+                if let Ok(mut log) = iq_log.lock() {
+                    log.extend(v.iter().map(|c| IqSample { i: c.re, q: c.im }));
+                    while log.len() > iq_cap {
+                        log.pop_front();
+                    }
+                }
+            }
+
             push_window(&mut window, &block);
             let rms = block_rms(&block);
             let mut spectrum: Option<(Vec<f32>, f32)> = None;
@@ -340,7 +415,7 @@ fn spawn_worker(
                 last_fft = Instant::now();
             }
 
-            let new = decode_block(&mut decoder, &block);
+            let new = decode_block(&mut decoder, &mut resampler, &block);
 
             if let Ok(mut s) = shared.lock() {
                 s.total_samples += n as u64;
@@ -428,20 +503,43 @@ fn block_rms(block: &Chunk) -> f32 {
     }
 }
 
-fn decode_block(decoder: &mut Option<Decoder>, block: &Chunk) -> Vec<Frame> {
+fn decode_block(
+    decoder: &mut Option<Decoder>,
+    resampler: &mut Option<StreamResampler>,
+    block: &Chunk,
+) -> Vec<Frame> {
     let Some(dec) = decoder.as_mut() else {
         return Vec::new();
     };
     match block {
         Chunk::Iq(v) => {
-            let mut ilv = Vec::with_capacity(v.len() * 2);
-            for c in v {
+            let resampled;
+            let samples: &[Cf] = match resampler {
+                Some(rs) => {
+                    let mut out = Vec::new();
+                    rs.process(v, &mut out);
+                    resampled = out;
+                    &resampled
+                }
+                None => v,
+            };
+            let mut ilv = Vec::with_capacity(samples.len() * 2);
+            for c in samples {
                 ilv.push(c.re);
                 ilv.push(c.im);
             }
             dec.feed_iq_collect(&ilv)
         }
-        Chunk::Mono(pcm) => dec.feed_collect(pcm),
+        Chunk::Mono(pcm) => match resampler {
+            Some(rs) => {
+                let cin: Vec<Cf> = pcm.iter().map(|&s| Cf::new(f32::from(s), 0.0)).collect();
+                let mut out = Vec::new();
+                rs.process(&cin, &mut out);
+                let res: Vec<i16> = out.iter().map(|c| c.re as i16).collect();
+                dec.feed_collect(&res)
+            }
+            None => dec.feed_collect(pcm),
+        },
     }
 }
 

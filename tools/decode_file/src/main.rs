@@ -25,7 +25,9 @@ use openhoshimi_runtime::pipeline::{
     infer_tuning_offset_hz, is_ao40_fec_downlink, prepare_linear_iq_setup_scored, select_downlink,
     BitPipeline, DecodedFrame, InputKind, SoftAo40Pipeline,
 };
+use openhoshimi_runtime::soundmodem_frontend::StreamResampler;
 use openhoshimi_telemetry::SchemaParser;
+use rustfft::num_complex::Complex;
 
 mod live;
 
@@ -314,9 +316,13 @@ fn hexdump(data: &[u8], color: bool) {
 fn run_soundmodem_raw(input: &Path, tlm_out: Option<&Path>) -> Result<(), String> {
     let mut source = open_audio_source(input)?;
     let fs = source.sample_rate();
-    if fs != openhoshimi_soundmodem::SAMPLE_RATE {
+    // The decoder's symbol timing is fixed at 48 kHz; resample any other rate
+    // so recordings from soundcards/SDRs at 44.1 kHz, 96 kHz, etc. still decode.
+    let mut resampler = (fs != openhoshimi_soundmodem::SAMPLE_RATE)
+        .then(|| StreamResampler::new(fs, openhoshimi_soundmodem::SAMPLE_RATE));
+    if resampler.is_some() {
         eprintln!(
-            "decode_file: warning: soundmodem raw expects {} Hz mono, got {fs} Hz",
+            "decode_file: resampling {fs} Hz -> {} Hz for the decoder",
             openhoshimi_soundmodem::SAMPLE_RATE
         );
     }
@@ -327,7 +333,16 @@ fn run_soundmodem_raw(input: &Path, tlm_out: Option<&Path>) -> Result<(), String
         match source.read_samples(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let pcm: Vec<i16> = buf[..n].iter().map(|&x| (x * 32767.0) as i16).collect();
+                let pcm: Vec<i16> = match resampler.as_mut() {
+                    Some(rs) => {
+                        let cin: Vec<Complex<f32>> =
+                            buf[..n].iter().map(|&x| Complex::new(x, 0.0)).collect();
+                        let mut out = Vec::new();
+                        rs.process(&cin, &mut out);
+                        out.iter().map(|c| (c.re * 32767.0) as i16).collect()
+                    }
+                    None => buf[..n].iter().map(|&x| (x * 32767.0) as i16).collect(),
+                };
                 frames.extend(dec.feed_collect(&pcm));
             }
             Err(IoError::EndOfStream) => break,
