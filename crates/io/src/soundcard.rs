@@ -10,6 +10,10 @@ use openhoshimi_core::{InputSource, IoError, IqSample, IqSource};
 
 const DEFAULT_BUFFER_SAMPLES: usize = 48_000;
 
+/// How long `read_samples` blocks waiting for capture data before returning a
+/// zero-length read, so a stalled device or a stopping consumer never hangs.
+const WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// How `build_stream` should pull samples out of an interleaved frame of
 /// per-channel data.
 ///
@@ -201,10 +205,17 @@ impl InputSource for SoundcardSource {
             .lock()
             .map_err(|_| IoError::Format("soundcard buffer lock poisoned".to_string()))?;
 
+        // Bounded wait so a stalled or stopping consumer stays responsive: a
+        // timeout with no data returns Ok(0) (a heartbeat) rather than blocking
+        // the caller forever, which would wedge shutdown.
         while guard.buffer.is_empty() && !guard.closed && guard.error.is_none() {
-            guard = cvar
-                .wait(guard)
+            let (next, res) = cvar
+                .wait_timeout(guard, WAIT_TIMEOUT)
                 .map_err(|_| IoError::Format("soundcard wait failed".to_string()))?;
+            guard = next;
+            if res.timed_out() && guard.buffer.is_empty() {
+                return Ok(0);
+            }
         }
 
         if let Some(err) = guard.error.take() {
@@ -354,11 +365,17 @@ impl IqSource for SoundcardIqSource {
             .lock()
             .map_err(|_| IoError::Format("soundcard buffer lock poisoned".to_string()))?;
 
-        // Wait until at least one full IQ pair is available.
+        // Wait (bounded) until at least one full IQ pair is available; a
+        // timeout with nothing buffered returns Ok(0) so a stalled or stopping
+        // consumer never blocks forever.
         while guard.buffer.len() < 2 && !guard.closed && guard.error.is_none() {
-            guard = cvar
-                .wait(guard)
+            let (next, res) = cvar
+                .wait_timeout(guard, WAIT_TIMEOUT)
                 .map_err(|_| IoError::Format("soundcard wait failed".to_string()))?;
+            guard = next;
+            if res.timed_out() && guard.buffer.len() < 2 {
+                return Ok(0);
+            }
         }
 
         if let Some(err) = guard.error.take() {

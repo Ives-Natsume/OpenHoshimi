@@ -107,7 +107,7 @@ fn block_peaks(
 /// Stateful rational polyphase resampler (upfirdn) for a streaming complex
 /// signal: `out_rate = in_rate * l / m`. Carries filter history across calls so
 /// block boundaries introduce no transient.
-struct StreamResampler {
+pub struct StreamResampler {
     l: usize,
     m: usize,
     taps: Vec<f32>,
@@ -119,7 +119,9 @@ struct StreamResampler {
 }
 
 impl StreamResampler {
-    fn new(in_fs: u32, out_fs: u32) -> Self {
+    /// Build a resampler mapping `in_fs` to `out_fs` (e.g. a 44.1 kHz soundcard
+    /// to the decoder's 48 kHz). `l/m` is the reduced ratio.
+    pub fn new(in_fs: u32, out_fs: u32) -> Self {
         let g = gcd(in_fs as usize, out_fs as usize);
         let l = out_fs as usize / g;
         let m = in_fs as usize / g;
@@ -150,7 +152,8 @@ impl StreamResampler {
         }
     }
 
-    fn process(&mut self, block: &[Complex32], out: &mut Vec<Complex32>) {
+    /// Resample `block`, appending the output samples to `out`.
+    pub fn process(&mut self, block: &[Complex32], out: &mut Vec<Complex32>) {
         if self.l == 1 && self.m == 1 {
             out.extend_from_slice(block);
             return;
