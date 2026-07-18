@@ -426,3 +426,52 @@ pub fn decode_iq(iq: &[IqSample], fs: u32) -> Vec<Frame> {
     all.retain(|f| seen.insert(f.data.clone()));
     all
 }
+
+/// De-rotate the strongest Doppler track over the whole recording and resample
+/// to 48 kHz, returning the baseband IQ the streaming decoder expects.
+///
+/// This is the same survey/fit/de-rotate front-end [`decode_iq`] feeds to the
+/// C decoder, stopped one step short of decoding. Exporting its output gives a
+/// known-good 48 kHz baseband stream for exercising the live path from a file
+/// when no radio is on hand. Returns empty if no track is found.
+pub fn derotate_iq_48k(iq: &[IqSample], fs: u32) -> Vec<IqSample> {
+    if iq.is_empty() {
+        return Vec::new();
+    }
+    let cplx: Vec<Complex32> = iq.iter().map(|s| Complex32::new(s.i, s.q)).collect();
+    let sv = survey(&cplx, fs);
+    let anchors: Vec<(f32, f32)> = sv
+        .iter()
+        .enumerate()
+        .filter(|(_, &(_, m))| m >= ANCHOR_MARGIN)
+        .map(|(b, &(f, _))| (b as f32, f))
+        .collect();
+    let tracks = ransac_tracks(&anchors);
+    // The strongest track carries the most supporting anchors.
+    let Some(best) = tracks.iter().max_by_key(|t| t.ats.len()) else {
+        return Vec::new();
+    };
+    let (a, b) = (best.a, best.b);
+
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let mut phase = 0.0f64;
+    let mixed: Vec<Complex32> = cplx
+        .iter()
+        .enumerate()
+        .map(|(i, z)| {
+            let t = i as f32 / fs as f32;
+            let fc = a + b * t;
+            phase = (phase - two_pi * fc as f64 / fs as f64).rem_euclid(two_pi);
+            let (s, c) = phase.sin_cos();
+            let (s, c) = (s as f32, c as f32);
+            Complex32::new(z.re * c - z.im * s, z.re * s + z.im * c)
+        })
+        .collect();
+
+    let mut rs = StreamResampler::new(fs, SAMPLE_RATE);
+    let mut res = Vec::new();
+    rs.process(&mixed, &mut res);
+    res.into_iter()
+        .map(|c| IqSample { i: c.re, q: c.im })
+        .collect()
+}

@@ -50,6 +50,52 @@ extern "C" {
         color: c_int,
         full: c_int,
     ) -> c_int;
+    fn tm_decoder_feed_fields(
+        dec: *mut TmDecoder,
+        frame: *const u8,
+        out: *mut TmFieldOut,
+        cap: usize,
+    ) -> c_int;
+}
+
+/// C ABI mirror of `struct tm_field_out`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TmFieldOut {
+    packet: *const c_char,
+    cn: *const c_char,
+    en: *const c_char,
+    unit: *const c_char,
+    value: [c_char; 64],
+    kind: u8,
+}
+
+/// The value class of a [`DecodedField`], hinting how to type its `value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    /// A scaled or raw number (`value` parses as a decimal).
+    Number,
+    /// An enumeration description or other textual value.
+    Enum,
+    /// A raw hex string (e.g. `0xDEADBEEF`).
+    Hex,
+}
+
+/// One decoded telemetry field extracted from a frame.
+#[derive(Debug, Clone)]
+pub struct DecodedField {
+    /// Packet code the field belongs to, e.g. `"SAT-S0"`.
+    pub packet: String,
+    /// Field name (Chinese).
+    pub cn: String,
+    /// Field name (English), may be empty.
+    pub en: String,
+    /// Engineering unit, empty when unit-less.
+    pub unit: String,
+    /// Formatted value (scaled number, enum description or hex string).
+    pub value: String,
+    /// How to interpret `value`.
+    pub kind: FieldKind,
 }
 
 /// Opaque handle to a stateful telemetry decoder; never dereferenced in Rust.
@@ -229,6 +275,58 @@ impl TelemetryDecoder {
         let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
         String::from_utf8_lossy(&out[..end]).into_owned()
     }
+
+    /// Feed one 223-byte frame and return the structured fields of every packet
+    /// completed within it (empty when none). Frames not exactly [`FRAME_LEN`]
+    /// bytes are ignored.
+    pub fn feed_fields(&mut self, frame: &[u8]) -> Vec<DecodedField> {
+        if frame.len() != FRAME_LEN {
+            return Vec::new();
+        }
+        // A frame completes at most a couple of packets (≤144 fields each).
+        const CAP: usize = 512;
+        // SAFETY: TmFieldOut is plain data; a zeroed instance (null pointers,
+        // empty value) is a valid placeholder the C side overwrites.
+        let mut out = vec![unsafe { std::mem::zeroed::<TmFieldOut>() }; CAP];
+        // SAFETY: raw is valid; frame is FRAME_LEN bytes; out has CAP entries.
+        let n = unsafe { tm_decoder_feed_fields(self.raw, frame.as_ptr(), out.as_mut_ptr(), CAP) };
+        let n = usize::try_from(n).unwrap_or(0).min(CAP);
+        out[..n]
+            .iter()
+            .map(|f| DecodedField {
+                packet: cstr(f.packet),
+                cn: cstr(f.cn),
+                en: cstr(f.en),
+                unit: cstr(f.unit),
+                value: cstr_array(&f.value),
+                kind: match f.kind {
+                    1 => FieldKind::Enum,
+                    2 => FieldKind::Hex,
+                    _ => FieldKind::Number,
+                },
+            })
+            .collect()
+    }
+}
+
+/// Read a NUL-terminated C string pointer into an owned `String` (empty on
+/// null).
+fn cstr(p: *const c_char) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    // SAFETY: the pointer references a NUL-terminated static string in the C
+    // tables, valid for the program's lifetime.
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Read a fixed C `char` array up to its first NUL into an owned `String`.
+fn cstr_array(a: &[c_char]) -> String {
+    let bytes: &[u8] = unsafe { &*(a as *const [c_char] as *const [u8]) };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 impl Drop for TelemetryDecoder {

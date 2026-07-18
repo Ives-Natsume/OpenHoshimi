@@ -314,10 +314,14 @@ struct tm_decoder {
 	struct depacket dp;
 };
 
-/* Process one frame's KISS stream, rendering completed packets at out+n. */
-static size_t process_frame(struct depacket *dp, const unsigned char *frame,
-			    char *out, size_t cap, size_t n, int color,
-			    int full, int *count)
+/* A completed packet is handed to a sink so text rendering and structured
+ * field extraction can share the KISS de-packetiser. */
+typedef void (*tm_packet_cb)(void *ctx, const struct tm_packet *p,
+			     const unsigned char *body, size_t len);
+
+/* Process one frame's KISS stream, invoking `cb` for each completed packet. */
+static void process_frame(struct depacket *dp, const unsigned char *frame,
+			  tm_packet_cb cb, void *ctx, int *count)
 {
 	unsigned int contlen = frame[4];
 	unsigned int bi;
@@ -331,7 +335,7 @@ static size_t process_frame(struct depacket *dp, const unsigned char *frame,
 	 * unrelated), so skip it rather than mis-parse.
 	 */
 	if (contlen > FRAME_LEN - 5u)
-		return n;
+		return;
 
 	/* Body tail carried over from the previous frame. */
 	for (bi = 5; bi < 5u + contlen && bi < FRAME_LEN; bi++) {
@@ -346,8 +350,7 @@ static size_t process_frame(struct depacket *dp, const unsigned char *frame,
 			const struct tm_packet *p = tm_lookup(dp->main, dp->sub);
 
 			if (p != NULL && dp->idx > 0) {
-				n += render_packet(p, dp->buf, dp->idx,
-						   out + n, cap - n, color, full);
+				cb(ctx, p, dp->buf, dp->idx);
 				(*count)++;
 			}
 			dp->idx = 0;
@@ -376,14 +379,59 @@ static size_t process_frame(struct depacket *dp, const unsigned char *frame,
 			break;
 		}
 	}
-	return n;
+}
+
+/* Sink that renders each packet as text into a bounded buffer. */
+struct text_sink {
+	char	*out;
+	size_t	cap;
+	size_t	n;
+	int	color;
+	int	full;
+};
+
+static void text_cb(void *ctx, const struct tm_packet *p,
+		    const unsigned char *body, size_t len)
+{
+	struct text_sink *s = (struct text_sink *)ctx;
+
+	if (s->n < s->cap)
+		s->n += render_packet(p, body, len, s->out + s->n,
+				      s->cap - s->n, s->color, s->full);
+}
+
+/* Sink that appends each packet's decoded fields to a caller array. */
+struct field_sink {
+	struct tm_field_out	*out;
+	size_t			cap;
+	size_t			n;
+};
+
+static void field_cb(void *ctx, const struct tm_packet *p,
+		     const unsigned char *body, size_t len)
+{
+	struct field_sink *s = (struct field_sink *)ctx;
+	unsigned int i;
+
+	for (i = 0; i < p->nfield && s->n < s->cap; i++) {
+		const struct tm_field *f = &p->fields[i];
+		struct tm_field_out *o = &s->out[s->n++];
+
+		o->packet = p->name;
+		o->cn = f->cn;
+		o->en = f->en;
+		o->unit = f->unit;
+		o->kind = (unsigned char)(f->map != NULL ? 1
+			: (f->base == TM_HX || f->base == TM_RSVD ? 2 : 0));
+		format_value(f, body, len, o->value, sizeof(o->value));
+	}
 }
 
 int tm_decode_frames(const unsigned char *frames, size_t nframes,
 		     char *out, size_t cap, int color, int full)
 {
 	struct depacket dp;
-	size_t n = 0;
+	struct text_sink sink = { out, cap, 0, color, full };
 	size_t fi;
 	int count = 0;
 
@@ -391,8 +439,8 @@ int tm_decode_frames(const unsigned char *frames, size_t nframes,
 	if (cap > 0)
 		out[0] = '\0';
 	for (fi = 0; fi < nframes; fi++)
-		n = process_frame(&dp, frames + fi * FRAME_LEN, out, cap, n,
-				  color, full, &count);
+		process_frame(&dp, frames + fi * FRAME_LEN, text_cb, &sink,
+			      &count);
 	return count;
 }
 
@@ -411,10 +459,21 @@ void tm_decoder_close(struct tm_decoder *dec)
 int tm_decoder_feed(struct tm_decoder *dec, const unsigned char *frame,
 		    char *out, size_t cap, int color, int full)
 {
+	struct text_sink sink = { out, cap, 0, color, full };
 	int count = 0;
 
 	if (cap > 0)
 		out[0] = '\0';
-	process_frame(&dec->dp, frame, out, cap, 0, color, full, &count);
+	process_frame(&dec->dp, frame, text_cb, &sink, &count);
 	return count;
+}
+
+int tm_decoder_feed_fields(struct tm_decoder *dec, const unsigned char *frame,
+			   struct tm_field_out *out, size_t cap)
+{
+	struct field_sink sink = { out, cap, 0 };
+	int count = 0;
+
+	process_frame(&dec->dp, frame, field_cb, &sink, &count);
+	return (int)sink.n;
 }

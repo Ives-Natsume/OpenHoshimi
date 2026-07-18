@@ -96,4 +96,26 @@ void tm_decoder_close(struct tm_decoder *dec);
 int tm_decoder_feed(struct tm_decoder *dec, const unsigned char *frame,
 		    char *out, size_t cap, int color, int full);
 
+/*
+ * One decoded field, as filled by tm_decoder_feed_fields. The string pointers
+ * reference static table storage (valid for the program's lifetime); `value`
+ * is a formatted copy in the caller's array. `kind` is 0 for a number, 1 for
+ * an enumeration / textual value, 2 for a raw hex value.
+ */
+struct tm_field_out {
+	const char	*packet;	/* packet code, e.g. "SAT-S0"	*/
+	const char	*cn;		/* field Chinese name		*/
+	const char	*en;		/* field English name		*/
+	const char	*unit;		/* unit, "" when none		*/
+	char		value[64];
+	unsigned char	kind;
+};
+
+/*
+ * Feed one 223-byte frame and write the fields of every packet completed in
+ * it into `out` (up to `cap` entries). Returns the number of fields written.
+ */
+int tm_decoder_feed_fields(struct tm_decoder *dec, const unsigned char *frame,
+			   struct tm_field_out *out, size_t cap);
+
 #endif /* ASRTU_TM_H */

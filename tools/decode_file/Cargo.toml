@@ -21,3 +21,5 @@ openhoshimi-io = { workspace = true }
 openhoshimi-runtime = { workspace = true }
 openhoshimi-soundmodem = { workspace = true }
 clap = { workspace = true }
+rustfft = { workspace = true }
+ratatui = { workspace = true }

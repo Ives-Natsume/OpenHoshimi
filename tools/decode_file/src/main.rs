@@ -27,13 +27,17 @@ use openhoshimi_runtime::pipeline::{
 };
 use openhoshimi_telemetry::SchemaParser;
 
+mod live;
+
 const READ_CHUNK: usize = 4096;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Args {
-    satellite_toml: PathBuf,
-    input_wav: PathBuf,
+    /// Satellite TOML. Required except in `--live` mode.
+    satellite_toml: Option<PathBuf>,
+    /// Input WAV. Required except in `--live` mode.
+    input_wav: Option<PathBuf>,
     /// How to interpret the input WAV: `auto` (sniff the file, default),
     /// `iq` (force stereo I/Q), `fm` (FM-discriminator mono audio), or
     /// `ssb` (single-sideband mono audio with `--audio-carrier-hz`
@@ -67,6 +71,37 @@ struct Args {
     /// shows only a one-line-per-packet summary to stay readable.
     #[arg(long)]
     tlm_out: Option<PathBuf>,
+    /// Live-decode ASRTU-1 from a soundcard through the streaming soundmodem
+    /// decoder, with an interactive terminal UI (device picker, spectrum and
+    /// live decode status). Takes no input file.
+    #[arg(long)]
+    live: bool,
+    /// Soundcard input device name for `--live`. When omitted, `--live` shows
+    /// an interactive picker (arrow keys, Enter to select).
+    #[arg(long)]
+    soundcard_device: Option<String>,
+    /// Feed `--live` from a 48 kHz IQ WAV instead of a soundcard, so the live
+    /// path can be exercised without a radio. Pair with a file produced by
+    /// `--export-iq`.
+    #[arg(long)]
+    live_file: Option<PathBuf>,
+    /// With `--soundmodem`, write the de-rotated 48 kHz baseband IQ (the signal
+    /// the decoder actually sees) to this WAV instead of decoding. The result
+    /// is a known-good input for `--live --live-file`.
+    #[arg(long)]
+    export_iq: Option<PathBuf>,
+    /// Treat the `--live` soundcard as a mono FM-audio feed rather than stereo
+    /// IQ (e.g. SDR# FM output through a virtual cable).
+    #[arg(long)]
+    live_mono: bool,
+    /// Stop `--live` automatically after this many seconds. Omit to run until
+    /// the user quits (q / Esc).
+    #[arg(long)]
+    live_seconds: Option<u64>,
+    /// Playback speed multiplier for `--live-file` (e.g. `4` to play a 5-minute
+    /// recording in ~75 s). Ignored for a soundcard, which is always real time.
+    #[arg(long, default_value_t = 1.0)]
+    live_speed: f32,
 }
 
 /// How the input file should be interpreted.
@@ -94,7 +129,11 @@ fn main() -> ExitCode {
 
 /// Decode ASRTU-1 via the vendored soundmodem C backend: slurp the input as
 /// stereo IQ and hand it to the windowed front-end, printing each frame.
-fn run_soundmodem(input: &Path, tlm_out: Option<&Path>) -> Result<(), String> {
+fn run_soundmodem(
+    input: &Path,
+    tlm_out: Option<&Path>,
+    export_iq: Option<&Path>,
+) -> Result<(), String> {
     let mut source =
         WavIqSource::open(input).map_err(|err| format!("failed to open IQ WAV: {err}"))?;
     let fs = source.sample_rate();
@@ -117,15 +156,68 @@ fn run_soundmodem(input: &Path, tlm_out: Option<&Path>) -> Result<(), String> {
         iq.len() as f32 / fs as f32
     );
 
+    if let Some(path) = export_iq {
+        let baseband = openhoshimi_runtime::soundmodem_frontend::derotate_iq_48k(&iq, fs);
+        if baseband.is_empty() {
+            return Err("export-iq: no Doppler track found to de-rotate".to_string());
+        }
+        write_iq_wav(path, &baseband, openhoshimi_soundmodem::SAMPLE_RATE)?;
+        eprintln!(
+            "decode_file: wrote {} de-rotated IQ samples ({:.1}s @ {} Hz) to {}",
+            baseband.len(),
+            baseband.len() as f32 / openhoshimi_soundmodem::SAMPLE_RATE as f32,
+            openhoshimi_soundmodem::SAMPLE_RATE,
+            path.display()
+        );
+        return Ok(());
+    }
+
     let frames = openhoshimi_runtime::soundmodem_frontend::decode_iq(&iq, fs);
-    print_sm_frames(&frames, input, tlm_out);
+    let tlm_path = tlm_out
+        .map(PathBuf::from)
+        .unwrap_or_else(|| input.with_extension("telemetry.txt"));
+    print_sm_frames(&frames, &tlm_path);
     Ok(())
+}
+
+/// Write interleaved IQ as a 16-bit stereo WAV (I = left, Q = right), peak
+/// normalised to avoid clipping. A minimal writer: the canonical 44-byte PCM
+/// header followed by the samples.
+fn write_iq_wav(path: &Path, iq: &[IqSample], sample_rate: u32) -> Result<(), String> {
+    let peak = iq
+        .iter()
+        .flat_map(|s| [s.i.abs(), s.q.abs()])
+        .fold(0.0f32, f32::max)
+        .max(1e-9);
+    let scale = 30000.0 / peak;
+    let mut pcm: Vec<u8> = Vec::with_capacity(iq.len() * 4);
+    for s in iq {
+        pcm.extend_from_slice(&((s.i * scale) as i16).to_le_bytes());
+        pcm.extend_from_slice(&((s.q * scale) as i16).to_le_bytes());
+    }
+    let data_len = pcm.len() as u32;
+    let byte_rate = sample_rate * 4;
+    let mut out: Vec<u8> = Vec::with_capacity(44 + pcm.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&4u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits/sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    out.extend_from_slice(&pcm);
+    std::fs::write(path, out).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 /// Print soundmodem frames: a header line per frame followed by a classic
 /// `hexdump -C`-style body (offset, two 8-byte hex groups, ASCII sidebar),
 /// coloured when stdout is a terminal and left plain when piped.
-fn print_sm_frames(frames: &[openhoshimi_soundmodem::Frame], input: &Path, tlm_out: Option<&Path>) {
+pub(crate) fn print_sm_frames(frames: &[openhoshimi_soundmodem::Frame], tlm_path: &Path) {
     let color = std::io::stdout().is_terminal();
     // Stateful decoder so each frame's telemetry prints directly beneath it
     // (packets straddle frames, so it carries reassembly state across feeds).
@@ -143,7 +235,7 @@ fn print_sm_frames(frames: &[openhoshimi_soundmodem::Frame], input: &Path, tlm_o
             print!("{}", dec.feed(&f.data, color, false));
         }
     }
-    eprintln!("decode_file: soundmodem decoded {} frame(s)", frames.len());
+    println!("decode_file: decoded {} frame(s)", frames.len());
 
     // The full report (every packet, hex dump + all fields) goes to a file;
     // the console kept only the per-frame summaries above.
@@ -151,12 +243,12 @@ fn print_sm_frames(frames: &[openhoshimi_soundmodem::Frame], input: &Path, tlm_o
     if full.is_empty() {
         return;
     }
-    let path = tlm_out
-        .map(PathBuf::from)
-        .unwrap_or_else(|| input.with_extension("telemetry.txt"));
-    match std::fs::write(&path, full) {
-        Ok(()) => println!("decode_file: full telemetry saved to {}", path.display()),
-        Err(err) => eprintln!("decode_file: could not write {}: {err}", path.display()),
+    match std::fs::write(tlm_path, full) {
+        Ok(()) => println!(
+            "decode_file: full telemetry saved to {}",
+            tlm_path.display()
+        ),
+        Err(err) => eprintln!("decode_file: could not write {}: {err}", tlm_path.display()),
     }
 }
 
@@ -246,23 +338,48 @@ fn run_soundmodem_raw(input: &Path, tlm_out: Option<&Path>) -> Result<(), String
     while let Some(f) = dec.poll() {
         frames.push(f);
     }
-    print_sm_frames(&frames, input, tlm_out);
+    let tlm_path = tlm_out
+        .map(PathBuf::from)
+        .unwrap_or_else(|| input.with_extension("telemetry.txt"));
+    print_sm_frames(&frames, &tlm_path);
     Ok(())
 }
 
 fn run() -> Result<(), String> {
     let args = Args::parse();
+    if args.live {
+        return live::run_live(live::LiveOpts {
+            device: args.soundcard_device.clone(),
+            mono: args.live_mono,
+            seconds: args.live_seconds,
+            tlm_out: args.tlm_out.clone(),
+            file: args.live_file.clone(),
+            speed: args.live_speed,
+        });
+    }
+    let input_wav = args
+        .input_wav
+        .as_deref()
+        .ok_or("an input WAV path is required (or use --live)")?;
     if args.soundmodem_raw {
-        return run_soundmodem_raw(&args.input_wav, args.tlm_out.as_deref());
+        return run_soundmodem_raw(input_wav, args.tlm_out.as_deref());
     }
     if args.soundmodem {
-        return run_soundmodem(&args.input_wav, args.tlm_out.as_deref());
+        return run_soundmodem(
+            input_wav,
+            args.tlm_out.as_deref(),
+            args.export_iq.as_deref(),
+        );
     }
     if let Some(path) = std::env::var_os("OPENHOSHIMI_SYMBOL_DUMP") {
         open_symbol_dump(Path::new(&path))
             .map_err(|err| format!("failed to open symbol dump file: {err}"))?;
     }
-    let satellite = load_satellite(&args.satellite_toml)
+    let satellite_toml = args
+        .satellite_toml
+        .as_deref()
+        .ok_or("a satellite TOML path is required")?;
+    let satellite = load_satellite(satellite_toml)
         .map_err(|err| format!("failed to load satellite definition: {err}"))?;
     let selected = select_downlink(&satellite)?;
     let telemetry = selected
@@ -294,17 +411,17 @@ fn run() -> Result<(), String> {
     };
 
     let tuning_offset_hz =
-        infer_tuning_offset_hz(&args.input_wav, selected.downlink.freq_hz).unwrap_or(0) as f32;
+        infer_tuning_offset_hz(input_wav, selected.downlink.freq_hz).unwrap_or(0) as f32;
     let mut runner = match selected.input_kind {
         InputKind::Audio => {
-            let source: Box<dyn InputSource> = open_audio_source(&args.input_wav)?;
+            let source: Box<dyn InputSource> = open_audio_source(input_wav)?;
             let sample_rate = source.sample_rate();
             let mut pipeline = BitPipeline::<f32>::new(selected.downlink)?;
             pipeline.configure_demodulator(selected.downlink, sample_rate, 0.0)?;
             PipelineRunner::Audio { source, pipeline }
         }
         InputKind::FmAudio => {
-            let source: Box<dyn InputSource> = open_audio_source(&args.input_wav)?;
+            let source: Box<dyn InputSource> = open_audio_source(input_wav)?;
             let sample_rate = source.sample_rate();
             let mut pipeline = BitPipeline::<f32>::new(selected.downlink)?;
             pipeline.configure_fm_audio_demodulator(selected.downlink, sample_rate)?;
@@ -312,7 +429,7 @@ fn run() -> Result<(), String> {
         }
         InputKind::Iq => {
             let resolved_mode: IoAudioMode = match args.audio_mode {
-                AudioMode::Auto => detect_audio_mode_auto(&args.input_wav)?,
+                AudioMode::Auto => detect_audio_mode_auto(input_wav)?,
                 AudioMode::Iq => IoAudioMode::Iq,
                 AudioMode::Fm => IoAudioMode::Fm,
                 AudioMode::Ssb => IoAudioMode::Ssb,
@@ -320,7 +437,7 @@ fn run() -> Result<(), String> {
             match resolved_mode {
                 IoAudioMode::Fm => {
                     eprintln!("decode_file: treating mono input as FM-discriminator audio");
-                    let source: Box<dyn InputSource> = open_audio_source(&args.input_wav)?;
+                    let source: Box<dyn InputSource> = open_audio_source(input_wav)?;
                     let sample_rate = source.sample_rate();
                     let mut pipeline = BitPipeline::<f32>::new(selected.downlink)?;
                     pipeline.configure_fm_audio_demodulator(selected.downlink, sample_rate)?;
@@ -332,7 +449,7 @@ fn run() -> Result<(), String> {
                             "SSB audio mode does not support AO-40 FEC downlinks".to_string()
                         );
                     }
-                    let mut mono: Box<dyn InputSource> = open_audio_source(&args.input_wav)?;
+                    let mut mono: Box<dyn InputSource> = open_audio_source(input_wav)?;
                     let sample_rate = mono.sample_rate();
                     let (carrier_hz, prefix) = match args.audio_carrier_hz {
                         Some(value) => {
@@ -384,9 +501,9 @@ fn run() -> Result<(), String> {
                     }
                 }
                 IoAudioMode::Iq => {
-                    let source = WavIqSource::open(&args.input_wav)
+                    let source = WavIqSource::open(input_wav)
                         .map_err(|err| format!("failed to open WAV as IQ: {err}"))?;
-                    build_iq_runner(source, &args.input_wav, selected.downlink, tuning_offset_hz)?
+                    build_iq_runner(source, input_wav, selected.downlink, tuning_offset_hz)?
                 }
                 IoAudioMode::Auto => unreachable!("IoAudioMode::Auto is resolved above"),
             }
