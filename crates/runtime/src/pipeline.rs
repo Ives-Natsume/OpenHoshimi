@@ -2162,6 +2162,7 @@ fn codec_kind(downlink: &DownlinkDef) -> Option<CodecKind> {
         Some(CodecDef::CcsdsConcat {
             frame_size,
             differential,
+            ..
         }) => Some(CodecKind::CcsdsConcat {
             frame_size: *frame_size,
             differential: *differential,

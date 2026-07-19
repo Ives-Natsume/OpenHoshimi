@@ -53,6 +53,7 @@ payload_bits = 2040
 kind = "ccsds_concat"
 frame_size = 223
 differential = true
+soundmodem = true
 
 [[downlink]]
 label = "9k6 BPSK SSDV images"
@@ -89,3 +90,4 @@ payload_bits = 2040
 kind = "ccsds_concat"
 frame_size = 223
 differential = true
+soundmodem = true

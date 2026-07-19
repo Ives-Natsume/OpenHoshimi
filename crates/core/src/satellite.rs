@@ -354,6 +354,12 @@ pub enum CodecDef {
         /// Apply differential decoding after Viterbi.
         #[serde(default = "default_true")]
         differential: bool,
+        /// Route this downlink through the vendored soundmodem C decoder
+        /// (streaming demod + RS(255,223) + telemetry) instead of the native
+        /// Rust bit pipeline. Used by ASRTU-1 (AO-123), whose 9k6 BPSK the
+        /// soundmodem front-end decodes at a markedly higher yield.
+        #[serde(default)]
+        soundmodem: bool,
     },
     /// FX.25 frame decoder placeholder.
     Fx25,
