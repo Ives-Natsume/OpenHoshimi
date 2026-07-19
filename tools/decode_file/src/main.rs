@@ -1146,6 +1146,7 @@ fn format_telemetry_value(field: &openhoshimi_core::TelemetryField) -> String {
         openhoshimi_core::TelemetryValue::Float(value) => format_float(*value),
         openhoshimi_core::TelemetryValue::Int(value) => value.to_string(),
         openhoshimi_core::TelemetryValue::Bool(value) => value.to_string(),
+        openhoshimi_core::TelemetryValue::Text(text) => text.clone(),
         openhoshimi_core::TelemetryValue::Bytes(bytes) => format_hex(bytes),
     };
     match &field.unit {

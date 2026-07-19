@@ -4,10 +4,11 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,10 +21,11 @@ use eframe::egui::{
 use egui_extras::{Column, TableBuilder};
 use openhoshimi_codec::SstvAnalyzer;
 use openhoshimi_core::satellite::{
-    load_all_satellites, DownlinkDef, ImageDef, ModemDef, SatelliteDefinition,
+    load_all_satellites, CodecDef, DownlinkDef, ImageDef, ModemDef, SatelliteDefinition,
 };
 use openhoshimi_core::{
     Frame as CoreFrame, InputSource, IoError, IqSample, IqSource, TelemetryField, TelemetryValue,
+    WarnLevel,
 };
 use openhoshimi_dsp::estimate_audio_carrier;
 use openhoshimi_io::{
@@ -38,19 +40,42 @@ use openhoshimi_runtime::pipeline::{
     prepare_linear_iq_setup_scored_with_progress, BitPipeline, DecodedFrame, InputKind,
     PipelineStats, SoftAo40Pipeline,
 };
+use openhoshimi_runtime::soundmodem_frontend::{
+    decode_iq as soundmodem_decode_iq, StreamResampler,
+};
+use openhoshimi_soundmodem::{
+    DecodedField, Decoder as SmDecoder, FieldKind, Frame as SmFrame, TelemetryDecoder,
+    SAMPLE_RATE as SM_SAMPLE_RATE,
+};
 use openhoshimi_telemetry::SchemaParser;
 use rfd::FileDialog;
 use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
 const READ_CHUNK: usize = 4096;
+/// Soundmodem live-decode cadence, in seconds: for a real-time capture (a
+/// soundcard, or a WAV played at real time) run the survey/replay pass this
+/// often over the trailing window, so a burst — and the KEY it carries —
+/// surfaces within a few seconds of arriving instead of at end of stream.
+const SM_LIVE_STEP_SECS: usize = 2;
+/// Trailing window decoded each live pass. Wider than the step so consecutive
+/// passes overlap (a burst is seen whole and gets several decode attempts),
+/// wide enough for the Doppler-track fit, but short to keep the latency and the
+/// per-pass cost low.
+const SM_LIVE_WINDOW_SECS: usize = 8;
+/// Soundmodem fast-file segment step, in seconds: how much fresh IQ triggers a
+/// disjoint segment hand-off. Larger than the live step so the whole file is
+/// covered with far fewer, cheaper passes when latency does not matter.
+const SM_FILE_STEP_SECS: usize = 15;
+/// Overlap tail, in seconds, kept after each fast-file segment so a burst on a
+/// segment boundary is re-found in the next pass; duplicates drop by hash.
+const SM_FILE_OVERLAP_SECS: usize = 5;
 const MAX_FRAMES: usize = 512;
 const MAX_WATERFALL_ROWS: usize = 256;
 const MAX_DIAGNOSTICS: usize = 24;
 const SPECTRUM_BINS: usize = 1024;
 const SPECTRUM_FFT_LEN: usize = 4096;
 const SPECTRUM_INTERVAL: Duration = Duration::from_millis(33);
-const RX_EVENT_QUEUE: usize = 1024;
 const WATERFALL_HEIGHT_PX: f32 = 220.0;
 const DEFAULT_WATERFALL_MIN_DB: f32 = -90.0;
 const DEFAULT_WATERFALL_MAX_DB: f32 = -10.0;
@@ -128,8 +153,13 @@ struct ClosedHoshimiApp {
     waterfall_max_db: f32,
     rx_thread: Option<thread::JoinHandle<()>>,
     rx_stop: Option<Sender<()>>,
+    /// Per-session abort flag. Set on stop so the (detached, not joined) decode
+    /// thread and its background soundmodem decoder wind down and, crucially,
+    /// stop emitting frames — so switching recordings never blocks the UI on a
+    /// long in-flight decode, and no stale frame leaks into the next session.
+    rx_abort: Option<Arc<AtomicBool>>,
     rx_events: Receiver<RxEvent>,
-    rx_sender: SyncSender<RxEvent>,
+    rx_sender: Sender<RxEvent>,
     startup_wav: Option<PathBuf>,
     last_export_status: Option<String>,
     alignment_state: AlignmentState,
@@ -329,7 +359,13 @@ impl ClosedHoshimiApp {
 
         let satellites_dir = resolve_satellites_dir();
         let startup_wav = std::env::var_os("OPENHOSHIMI_OPEN_WAV").map(PathBuf::from);
-        let (rx_sender, rx_events) = mpsc::sync_channel(RX_EVENT_QUEUE);
+        // Unbounded: decoded frames must never be dropped when the channel is
+        // momentarily busy (a segment can emit a burst of frames at once, and a
+        // bounded try_send would silently drop them — losing packets the batch
+        // tool decodes). Spectrum is rate-limited at the source and progress
+        // events are tiny, and the UI drains the queue aggressively each frame,
+        // so it does not grow without bound.
+        let (rx_sender, rx_events) = mpsc::channel();
         let mut app = Self {
             satellites_dir,
             satellites: Vec::new(),
@@ -360,6 +396,7 @@ impl ClosedHoshimiApp {
             waterfall_max_db: DEFAULT_WATERFALL_MAX_DB,
             rx_thread: None,
             rx_stop: None,
+            rx_abort: None,
             rx_events,
             rx_sender,
             startup_wav,
@@ -486,6 +523,8 @@ impl ClosedHoshimiApp {
         }
 
         let (stop_tx, stop_rx) = mpsc::channel();
+        let abort = Arc::new(AtomicBool::new(false));
+        let worker_abort = Arc::clone(&abort);
         let events = self.rx_sender.clone();
         let input_mode = self.input_mode;
         let decode_pace = self.decode_pace;
@@ -510,10 +549,12 @@ impl ClosedHoshimiApp {
                 audio_carrier_hz,
                 events,
                 stop_rx,
+                worker_abort,
             )
         });
         self.rx_thread = Some(thread);
         self.rx_stop = Some(stop_tx);
+        self.rx_abort = Some(abort);
         self.running = true;
         self.input_progress_processed = 0;
         self.input_progress_total = None;
@@ -532,12 +573,22 @@ impl ClosedHoshimiApp {
         if !self.running && self.rx_thread.is_none() && self.rx_stop.is_none() {
             return;
         }
+        // Signal the worker to wind down. We do NOT join it: a soundmodem decode
+        // may be blocked for many seconds inside a survey/replay pass, and
+        // joining here would freeze the UI (e.g. when switching recordings).
+        // The abort flag makes the detached worker (and its background decoder)
+        // stop emitting at once, so no stale frame reaches the next session, and
+        // the thread cleans itself up in the background.
+        if let Some(abort) = self.rx_abort.take() {
+            abort.store(true, Ordering::SeqCst);
+        }
         if let Some(stop) = self.rx_stop.take() {
             let _ = stop.send(());
         }
-        if let Some(thread) = self.rx_thread.take() {
-            let _ = thread.join();
-        }
+        self.rx_thread = None;
+        // Drop events still buffered from the stopped session so none leak into
+        // the next recording after a switch.
+        while self.rx_events.try_recv().is_ok() {}
         self.running = false;
         self.status = "RX stopped".to_string();
         self.push_diagnostic(DiagnosticLevel::Info, self.status.clone());
@@ -547,7 +598,11 @@ impl ClosedHoshimiApp {
         let mut processed = 0usize;
         let mut latest_samples: Option<SpectrumSamples> = None;
         let mut latest_count = 0usize;
-        while processed < 128 {
+        // Drain generously each frame: on a fast file decode the worker can
+        // enqueue thousands of tiny progress events plus bursts of frames, and a
+        // low cap would leave frames waiting several UI frames behind the
+        // backlog. The events are cheap, so a high cap keeps the table current.
+        while processed < 8192 {
             let Ok(event) = self.rx_events.try_recv() else {
                 break;
             };
@@ -593,6 +648,7 @@ impl ClosedHoshimiApp {
                     self.running = false;
                     self.rx_thread = None;
                     self.rx_stop = None;
+                    self.rx_abort = None;
                     self.status = "RX stopped".to_string();
                     self.push_diagnostic(DiagnosticLevel::Info, self.status.clone());
                 }
@@ -2329,6 +2385,13 @@ impl ClosedHoshimiApp {
         let Some(downlink) = self.selected_downlink_cloned() else {
             return;
         };
+        // The soundmodem backend has its own IQ front-end (survey/replay with
+        // per-burst de-rotation), so the native linear-IQ alignment pre-flight
+        // is pure wasted work for it — and ruinously slow on a high-rate
+        // capture. Skip it.
+        if is_soundmodem_downlink(&downlink) {
+            return;
+        }
         if !matches!(input_kind_for(&downlink), Some(InputKind::Iq)) {
             return;
         }
@@ -2607,7 +2670,7 @@ impl ClosedHoshimiApp {
 /// wall-clock gate also keeps the row rate flat across vastly different
 /// sample rates.
 fn try_emit_spectrum<F: FnOnce() -> SpectrumSamples>(
-    events: &SyncSender<RxEvent>,
+    events: &Sender<RxEvent>,
     last: &mut Option<Instant>,
     build: F,
 ) {
@@ -2618,10 +2681,8 @@ fn try_emit_spectrum<F: FnOnce() -> SpectrumSamples>(
         }
     }
     let samples = build();
-    match events.try_send(RxEvent::Samples(samples)) {
-        Ok(_) => *last = Some(now),
-        Err(TrySendError::Full(_)) => {}
-        Err(TrySendError::Disconnected(_)) => *last = Some(now),
+    if events.send(RxEvent::Samples(samples)).is_ok() {
+        *last = Some(now);
     }
 }
 
@@ -2637,10 +2698,11 @@ fn run_decode_thread(
     cached_alignment: Option<CachedAlignment>,
     audio_mode: IoAudioMode,
     audio_carrier_hz: f32,
-    events: SyncSender<RxEvent>,
+    events: Sender<RxEvent>,
     stop: Receiver<()>,
+    abort: Arc<AtomicBool>,
 ) {
-    let _ = events.try_send(RxEvent::Dropped("priming WAV input\u{2026}".to_string()));
+    let _ = events.send(RxEvent::Dropped("priming WAV input\u{2026}".to_string()));
     let mut runtime = match build_runtime_input(
         input_mode,
         input_path,
@@ -2654,12 +2716,12 @@ fn run_decode_thread(
     ) {
         Ok(runtime) => runtime,
         Err(err) => {
-            let _ = events.try_send(RxEvent::Dropped(err));
-            let _ = events.try_send(RxEvent::Stopped);
+            let _ = events.send(RxEvent::Dropped(err));
+            let _ = events.send(RxEvent::Stopped);
             return;
         }
     };
-    let _ = events.try_send(RxEvent::SourceInfo {
+    let _ = events.send(RxEvent::SourceInfo {
         description: runtime.description().to_string(),
         sample_rate: runtime.sample_rate(),
     });
@@ -2671,7 +2733,7 @@ fn run_decode_thread(
         .map(SchemaParser::new);
     let sample_rate = runtime.sample_rate();
     let total_samples = runtime.total_samples();
-    let _ = events.try_send(RxEvent::Progress {
+    let _ = events.send(RxEvent::Progress {
         processed: 0,
         total: total_samples,
     });
@@ -2685,8 +2747,66 @@ fn run_decode_thread(
     // with FFT work; this keeps the row rate at ~30 Hz on every input.
     let mut last_spectrum_at: Option<Instant> = None;
 
+    // Both modes decode in windows on the background thread so frames stream out
+    // as the capture is read, never dumped at the end. A soundcard or a WAV
+    // played at real time is a *live* capture: decode a short trailing window
+    // stepped often (a small clone each step) so a burst surfaces within a few
+    // seconds. A WAV raced through at fast pace instead hands off larger,
+    // disjoint segments (moved, not cloned) as it reads — the reader never waits
+    // on the decoder, so the file (and its waterfall) races ahead while the
+    // decoder streams frames out behind it. `step` is how much fresh IQ triggers
+    // a pass; `keep` is the trailing window kept (live) or overlap tail retained
+    // (fast). All in samples at the capture rate.
+    let live_mode = matches!(input_mode, InputMode::Soundcard) || pace_realtime;
+    let (sm_step_samples, sm_keep_samples) = if live_mode {
+        (
+            sample_rate as usize * SM_LIVE_STEP_SECS,
+            sample_rate as usize * SM_LIVE_WINDOW_SECS,
+        )
+    } else {
+        (
+            sample_rate as usize * SM_FILE_STEP_SECS,
+            sample_rate as usize * SM_FILE_OVERLAP_SECS,
+        )
+    };
+
+    // Unbounded segment channel: the reader hands off without blocking, so the
+    // waterfall races ahead at full read speed. Each segment carries the read
+    // position at its end; the decoder reports *that* as Progress after it
+    // finishes the segment, so the progress bar tracks decoding, not reading —
+    // it reaches 100% exactly when the last frame is out, instead of hitting
+    // 100% while frames are still being decoded (which read like a hang). The
+    // reader suppresses its own Progress for this path. The worker bails on
+    // `abort`.
+    let (sm_decode_tx, sm_decode_handle) = match &runtime {
+        RuntimeInput::Soundmodem {
+            source: SoundmodemSource::Iq(_),
+            sample_rate,
+            ..
+        } => {
+            let (tx, rx) = mpsc::channel::<(Vec<IqSample>, u64)>();
+            let worker_events = events.clone();
+            let worker_abort = Arc::clone(&abort);
+            let fs = *sample_rate;
+            let start_at = start;
+            let handle = thread::spawn(move || {
+                soundmodem_decode_worker(
+                    rx,
+                    fs,
+                    total_samples,
+                    worker_events,
+                    start_at,
+                    worker_abort,
+                )
+            });
+            (Some(tx), Some(handle))
+        }
+        _ => (None, None),
+    };
+    let sm_iq_path = sm_decode_tx.is_some();
+
     loop {
-        if stop.try_recv().is_ok() {
+        if stop.try_recv().is_ok() || abort.load(Ordering::SeqCst) {
             break;
         }
         match &mut runtime {
@@ -2696,8 +2816,7 @@ fn run_decode_thread(
                     Ok(read) => read,
                     Err(IoError::EndOfStream) => break,
                     Err(err) => {
-                        let _ =
-                            events.try_send(RxEvent::Dropped(format!("audio read failed: {err}")));
+                        let _ = events.send(RxEvent::Dropped(format!("audio read failed: {err}")));
                         break;
                     }
                 };
@@ -2717,8 +2836,8 @@ fn run_decode_thread(
                     &mut count,
                     frames,
                 );
-                let _ = events.try_send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
-                let _ = events.try_send(RxEvent::Progress {
+                let _ = events.send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
+                let _ = events.send(RxEvent::Progress {
                     processed: pipeline.total_samples(),
                     total: total_samples,
                 });
@@ -2749,8 +2868,8 @@ fn run_decode_thread(
                         &mut count,
                         frames,
                     );
-                    let _ = events.try_send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
-                    let _ = events.try_send(RxEvent::Progress {
+                    let _ = events.send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
+                    let _ = events.send(RxEvent::Progress {
                         processed: pipeline.total_samples(),
                         total: total_samples,
                     });
@@ -2766,8 +2885,7 @@ fn run_decode_thread(
                     Ok(read) => read,
                     Err(IoError::EndOfStream) => break,
                     Err(err) => {
-                        let _ =
-                            events.try_send(RxEvent::Dropped(format!("IQ WAV read failed: {err}")));
+                        let _ = events.send(RxEvent::Dropped(format!("IQ WAV read failed: {err}")));
                         break;
                     }
                 };
@@ -2787,8 +2905,8 @@ fn run_decode_thread(
                     &mut count,
                     frames,
                 );
-                let _ = events.try_send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
-                let _ = events.try_send(RxEvent::Progress {
+                let _ = events.send(RxEvent::PipelineStats(pipeline.pipeline_stats()));
+                let _ = events.send(RxEvent::Progress {
                     processed: pipeline.total_samples(),
                     total: total_samples,
                 });
@@ -2818,7 +2936,7 @@ fn run_decode_thread(
                         &mut count,
                         decoded,
                     );
-                    let _ = events.try_send(RxEvent::Progress {
+                    let _ = events.send(RxEvent::Progress {
                         processed: pipeline.total_samples(),
                         total: total_samples,
                     });
@@ -2834,8 +2952,7 @@ fn run_decode_thread(
                     Ok(read) => read,
                     Err(IoError::EndOfStream) => break,
                     Err(err) => {
-                        let _ =
-                            events.try_send(RxEvent::Dropped(format!("IQ WAV read failed: {err}")));
+                        let _ = events.send(RxEvent::Dropped(format!("IQ WAV read failed: {err}")));
                         break;
                     }
                 };
@@ -2854,7 +2971,7 @@ fn run_decode_thread(
                     &mut count,
                     decoded,
                 );
-                let _ = events.try_send(RxEvent::Progress {
+                let _ = events.send(RxEvent::Progress {
                     processed: pipeline.total_samples(),
                     total: total_samples,
                 });
@@ -2874,13 +2991,12 @@ fn run_decode_thread(
                     Ok(read) => read,
                     Err(IoError::EndOfStream) => {
                         for image in analyzer.finish() {
-                            let _ = events.try_send(RxEvent::SstvImage(Box::new(image)));
+                            let _ = events.send(RxEvent::SstvImage(Box::new(image)));
                         }
                         break;
                     }
                     Err(err) => {
-                        let _ =
-                            events.try_send(RxEvent::Dropped(format!("audio read failed: {err}")));
+                        let _ = events.send(RxEvent::Dropped(format!("audio read failed: {err}")));
                         break;
                     }
                 };
@@ -2892,10 +3008,10 @@ fn run_decode_thread(
                 });
                 analyzer.push_samples(&samples[..read]);
                 for image in analyzer.drain_images() {
-                    let _ = events.try_send(RxEvent::SstvImage(Box::new(image)));
+                    let _ = events.send(RxEvent::SstvImage(Box::new(image)));
                 }
                 *processed_samples = processed_samples.saturating_add(read as u64);
-                let _ = events.try_send(RxEvent::Progress {
+                let _ = events.send(RxEvent::Progress {
                     processed: *processed_samples,
                     total: total_samples,
                 });
@@ -2905,10 +3021,145 @@ fn run_decode_thread(
                     break;
                 }
             }
+            RuntimeInput::Soundmodem {
+                source,
+                sample_rate: _,
+                iq,
+                since_decode,
+                mono,
+                processed_samples,
+            } => {
+                let read = match source {
+                    SoundmodemSource::Iq(src) => {
+                        let mut samples = [IqSample::default(); READ_CHUNK];
+                        let read = match src.read_samples(&mut samples) {
+                            Ok(read) => read,
+                            Err(IoError::EndOfStream) => {
+                                // Decode the still-undecoded trailing IQ (the last
+                                // partial window/segment), then finish.
+                                if *since_decode > 0 {
+                                    if let Some(tx) = sm_decode_tx.as_ref() {
+                                        let _ = tx.send((std::mem::take(iq), *processed_samples));
+                                    }
+                                }
+                                break;
+                            }
+                            Err(err) => {
+                                let _ = events.send(RxEvent::Dropped(format!(
+                                    "soundmodem IQ read failed: {err}"
+                                )));
+                                break;
+                            }
+                        };
+                        if read == 0 {
+                            continue;
+                        }
+                        try_emit_spectrum(&events, &mut last_spectrum_at, || {
+                            SpectrumSamples::Iq(samples[..read.min(SPECTRUM_FFT_LEN)].to_vec())
+                        });
+                        iq.extend_from_slice(&samples[..read]);
+                        *since_decode += read;
+                        if live_mode {
+                            // Sliding window: keep only the trailing window and,
+                            // each step, hand a copy to the background decoder so
+                            // a burst surfaces within a few seconds. Overlapping
+                            // windows plus payload-hash dedup catch every burst
+                            // without re-reporting it.
+                            if iq.len() > sm_keep_samples {
+                                iq.drain(0..iq.len() - sm_keep_samples);
+                            }
+                            if *since_decode >= sm_step_samples {
+                                *since_decode = 0;
+                                let pos = *processed_samples + read as u64;
+                                if let Some(tx) = sm_decode_tx.as_ref() {
+                                    let _ = tx.send((iq.clone(), pos));
+                                }
+                            }
+                        } else if *since_decode >= sm_step_samples {
+                            // Fast: hand off a disjoint segment (moved, not
+                            // cloned) the moment it fills, keeping only a short
+                            // overlap tail. Frames stream out behind the reader
+                            // as the decoder works through the queue.
+                            *since_decode = 0;
+                            let pos = *processed_samples + read as u64;
+                            let tail_start = iq.len().saturating_sub(sm_keep_samples);
+                            let tail = iq[tail_start..].to_vec();
+                            let segment = std::mem::replace(iq, tail);
+                            if let Some(tx) = sm_decode_tx.as_ref() {
+                                let _ = tx.send((segment, pos));
+                            }
+                        }
+                        read
+                    }
+                    SoundmodemSource::Mono(src) => {
+                        let stream = match mono.as_mut() {
+                            Some(stream) => stream,
+                            None => break,
+                        };
+                        let mut samples = [0.0f32; READ_CHUNK];
+                        let read = match src.read_samples(&mut samples) {
+                            Ok(read) => read,
+                            Err(IoError::EndOfStream) => break,
+                            Err(err) => {
+                                let _ = events.send(RxEvent::Dropped(format!(
+                                    "soundmodem audio read failed: {err}"
+                                )));
+                                break;
+                            }
+                        };
+                        if read == 0 {
+                            continue;
+                        }
+                        try_emit_spectrum(&events, &mut last_spectrum_at, || {
+                            SpectrumSamples::Audio(samples[..read.min(SPECTRUM_FFT_LEN)].to_vec())
+                        });
+                        let frames = feed_soundmodem_mono(
+                            &mut stream.decoder,
+                            stream.resampler.as_mut(),
+                            &samples[..read],
+                        );
+                        emit_soundmodem_frames(
+                            &events,
+                            &mut stream.telemetry,
+                            &start,
+                            &mut count,
+                            frames,
+                        );
+                        read
+                    }
+                };
+                *processed_samples = processed_samples.saturating_add(read as u64);
+                // For the IQ path the background decoder reports Progress by
+                // decode position instead, so the bar tracks decoding; only the
+                // inline mono path reports read position here.
+                if !sm_iq_path {
+                    let _ = events.send(RxEvent::Progress {
+                        processed: *processed_samples,
+                        total: total_samples,
+                    });
+                }
+                if pace_realtime
+                    && !pace_realtime_loop(start, sample_rate, *processed_samples, &stop)
+                {
+                    break;
+                }
+            }
         }
     }
 
-    let _ = events.try_send(RxEvent::Stopped);
+    // Close the segment channel and let the background soundmodem decoder drain
+    // its queue, so every decoded frame reaches the GUI before the stop signal.
+    drop(sm_decode_tx);
+    if let Some(handle) = sm_decode_handle {
+        let _ = handle.join();
+    }
+
+    // Only a naturally finished decode announces Stopped. A session aborted by
+    // stop()/a recording switch stays silent: the GUI already cleared this
+    // session's state, and a late Stopped would wrongly halt the next one.
+    if !abort.load(Ordering::SeqCst) {
+        let _ = events.send(RxEvent::Stopped);
+    }
 }
 
 fn pace_realtime_loop(
@@ -2965,6 +3216,73 @@ enum RuntimeInput {
         analyzer: SstvAnalyzer,
         processed_samples: u64,
     },
+    /// ASRTU-1 (AO-123) via the vendored soundmodem C decoder. An IQ capture
+    /// (soundcard or WAV) is accumulated and run through the offline
+    /// survey/replay front-end ([`soundmodem_decode_iq`]), the same high-yield
+    /// path as `decode_file --soundmodem`: it surveys the spectrum, fits
+    /// Doppler tracks and de-rotates each burst to baseband before the C
+    /// decoder, so an off-tune SDR recording decodes (a bare streaming feed
+    /// only works when the signal already sits at baseband). The capture is
+    /// decoded in overlapping segments so frames appear progressively and
+    /// memory stays bounded, with a final pass at end of stream; frames are
+    /// deduplicated by payload hash. A mono FM-audio capture has no IQ
+    /// front-end to apply, so it streams causally through the C decoder
+    /// instead. Selected when the downlink's codec is `ccsds_concat` with
+    /// `soundmodem = true`.
+    Soundmodem {
+        source: SoundmodemSource,
+        sample_rate: u32,
+        /// Accumulated IQ awaiting the next segment decode (unused for a mono
+        /// source); moved to the background decoder and reset to the overlap
+        /// tail each time a segment completes.
+        iq: Vec<IqSample>,
+        /// New IQ samples accumulated since the last segment was dispatched.
+        since_decode: usize,
+        /// Streaming engine for a mono (FM audio) source; `None` for IQ.
+        mono: Option<MonoStream>,
+        processed_samples: u64,
+    },
+}
+
+/// Streaming soundmodem engine for a mono FM-audio capture: the real audio is
+/// resampled to 48 kHz and fed causally to the C decoder (no IQ front-end).
+struct MonoStream {
+    decoder: SmDecoder,
+    telemetry: TelemetryDecoder,
+    /// Resamples to 48 kHz when the device rate differs; `None` when already
+    /// 48 kHz.
+    resampler: Option<StreamResampler>,
+}
+
+/// Capture side of a [`RuntimeInput::Soundmodem`]: a complex IQ device/file or
+/// a mono audio device/file, unified so the decode loop drives either through
+/// one arm.
+enum SoundmodemSource {
+    Iq(Box<dyn IqSource>),
+    Mono(Box<dyn InputSource>),
+}
+
+impl SoundmodemSource {
+    fn description(&self) -> &str {
+        match self {
+            Self::Iq(source) => source.description(),
+            Self::Mono(source) => source.description(),
+        }
+    }
+
+    fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Iq(source) => source.sample_rate(),
+            Self::Mono(source) => source.sample_rate(),
+        }
+    }
+
+    fn total_samples(&self) -> Option<u64> {
+        match self {
+            Self::Iq(source) => source.total_samples(),
+            Self::Mono(source) => source.total_samples(),
+        }
+    }
 }
 
 impl RuntimeInput {
@@ -2974,6 +3292,7 @@ impl RuntimeInput {
             Self::Iq { source, .. } => source.description(),
             Self::IqSoftAo40 { source, .. } => source.description(),
             Self::Sstv { source, .. } => source.description(),
+            Self::Soundmodem { source, .. } => source.description(),
         }
     }
 
@@ -2983,6 +3302,7 @@ impl RuntimeInput {
             Self::Iq { source, .. } => source.sample_rate(),
             Self::IqSoftAo40 { source, .. } => source.sample_rate(),
             Self::Sstv { source, .. } => source.sample_rate(),
+            Self::Soundmodem { source, .. } => source.sample_rate(),
         }
     }
 
@@ -2992,6 +3312,7 @@ impl RuntimeInput {
             Self::Iq { source, .. } => source.total_samples(),
             Self::IqSoftAo40 { source, .. } => source.total_samples(),
             Self::Sstv { source, .. } => source.total_samples(),
+            Self::Soundmodem { source, .. } => source.total_samples(),
         }
     }
 }
@@ -3006,10 +3327,18 @@ fn build_runtime_input(
     cached_alignment: Option<&CachedAlignment>,
     audio_mode: IoAudioMode,
     audio_carrier_hz: f32,
-    events: &SyncSender<RxEvent>,
+    events: &Sender<RxEvent>,
 ) -> Result<RuntimeInput, String> {
     if matches!(downlink.image, Some(ImageDef::Sstv {})) {
         return build_sstv_runtime_input(input_mode, input_path, soundcard_device);
+    }
+    if is_soundmodem_downlink(downlink) {
+        return build_soundmodem_runtime_input(
+            input_mode,
+            input_path,
+            soundcard_device,
+            audio_mode,
+        );
     }
     match input_mode {
         InputMode::Soundcard => {
@@ -3104,14 +3433,14 @@ fn build_runtime_input(
                             });
                             let (setup, prefix) = if let Some(cached) = cache_hit {
                                 if cached.prefix.is_empty() && cached.setup.sample_skip == 0 {
-                                    let _ = events.try_send(RxEvent::Dropped(format!(
+                                    let _ = events.send(RxEvent::Dropped(format!(
                                         "IQ alignment (non-linear): tuning={:.1} Hz",
                                         cached.setup.tuning_offset_hz
                                     )));
                                 } else {
                                     let prefix_len = sample_rate as usize * 8;
                                     let _ = read_iq_prefix(&mut source, prefix_len)?;
-                                    let _ = events.try_send(RxEvent::Dropped(format!(
+                                    let _ = events.send(RxEvent::Dropped(format!(
                                         "IQ alignment (cached): tuning={:.1} Hz skip={} prefix_frames={}",
                                         cached.setup.tuning_offset_hz,
                                         cached.setup.sample_skip,
@@ -3121,12 +3450,12 @@ fn build_runtime_input(
                                 (cached.setup.clone(), cached.prefix.clone())
                             } else {
                                 let prefix_len = sample_rate as usize * 8;
-                                let _ = events.try_send(RxEvent::Dropped(format!(
+                                let _ = events.send(RxEvent::Dropped(format!(
                                     "reading 8 s IQ prefix at {} Hz\u{2026}",
                                     sample_rate
                                 )));
                                 let mut prefix = read_iq_prefix(&mut source, prefix_len)?;
-                                let _ = events.try_send(RxEvent::Dropped(format!(
+                                let _ = events.send(RxEvent::Dropped(format!(
                                     "scoring IQ alignment over {} samples\u{2026}",
                                     prefix.len()
                                 )));
@@ -3138,14 +3467,14 @@ fn build_runtime_input(
                                 );
                                 let setup = match scored.as_ref() {
                                     Some((setup, frames)) => {
-                                        let _ = events.try_send(RxEvent::Dropped(format!(
+                                        let _ = events.send(RxEvent::Dropped(format!(
                                             "IQ alignment: tuning={:.1} Hz skip={} prefix_frames={}",
                                             setup.tuning_offset_hz, setup.sample_skip, frames
                                         )));
                                         setup.clone()
                                     }
                                     None => {
-                                        let _ = events.try_send(RxEvent::Dropped(format!(
+                                        let _ = events.send(RxEvent::Dropped(format!(
                                             "IQ alignment: TOML defaults (no candidate decoded; tuning={tuning_offset_hz:.1} Hz)"
                                         )));
                                         openhoshimi_runtime::pipeline::LinearIqSetup {
@@ -3188,7 +3517,7 @@ fn build_runtime_input(
                             }
                         }
                         IoAudioMode::Fm => {
-                            let _ = events.try_send(RxEvent::Dropped(
+                            let _ = events.send(RxEvent::Dropped(
                                 "audio mode: FM (mono real-audio path; tuning override ignored)"
                                     .to_string(),
                             ));
@@ -3210,7 +3539,7 @@ fn build_runtime_input(
                             let (carrier_hz, prefix) = if audio_carrier_hz.is_finite()
                                 && audio_carrier_hz > 0.0
                             {
-                                let _ = events.try_send(RxEvent::Dropped(format!(
+                                let _ = events.send(RxEvent::Dropped(format!(
                                     "audio mode: SSB (mono->IQ via {audio_carrier_hz:.1} Hz audio carrier, user-supplied)"
                                 )));
                                 (audio_carrier_hz, Vec::new())
@@ -3232,7 +3561,7 @@ fn build_runtime_input(
                                 .ok_or_else(|| {
                                     "SSB audio carrier auto-estimate failed: no peak in audio band; set Audio Carrier manually".to_string()
                                 })?;
-                                let _ = events.try_send(RxEvent::Dropped(format!(
+                                let _ = events.send(RxEvent::Dropped(format!(
                                     "audio mode: SSB (mono->IQ via {estimate:.1} Hz audio carrier, auto-estimated)"
                                 )));
                                 (estimate, prefix)
@@ -3258,6 +3587,298 @@ fn build_runtime_input(
                 None => Err("selected downlink is not supported by this input mode".to_string()),
             }
         }
+    }
+}
+
+/// True when the downlink routes through the vendored soundmodem C decoder
+/// (`ccsds_concat` codec with `soundmodem = true`).
+fn is_soundmodem_downlink(downlink: &DownlinkDef) -> bool {
+    matches!(
+        downlink.codec,
+        Some(CodecDef::CcsdsConcat {
+            soundmodem: true,
+            ..
+        })
+    )
+}
+
+/// Build the soundmodem runtime input. The capture is opened as complex IQ by
+/// default (matching the ASRTU-1 linear BPSK downlink), which feeds the offline
+/// survey/replay decoder; the FM audio mode picks the mono real-audio path
+/// instead (e.g. a virtual soundcard fed FM-demod audio), which streams
+/// causally through the C decoder with a 48 kHz resampler when the device rate
+/// differs.
+fn build_soundmodem_runtime_input(
+    input_mode: InputMode,
+    input_path: Option<PathBuf>,
+    soundcard_device: Option<String>,
+    audio_mode: IoAudioMode,
+) -> Result<RuntimeInput, String> {
+    let use_mono = matches!(audio_mode, IoAudioMode::Fm);
+    let source = match input_mode {
+        InputMode::Soundcard => {
+            if use_mono {
+                let src = match soundcard_device.as_deref() {
+                    Some(name) => SoundcardSource::open_by_name(name),
+                    None => SoundcardSource::open_default(),
+                }
+                .map_err(|err| format!("soundcard open failed: {err}"))?;
+                SoundmodemSource::Mono(Box::new(src))
+            } else {
+                let src = match soundcard_device.as_deref() {
+                    Some(name) => SoundcardIqSource::open_by_name(name),
+                    None => SoundcardIqSource::open_default(),
+                }
+                .map_err(|err| format!("soundcard IQ open failed: {err}"))?;
+                SoundmodemSource::Iq(Box::new(src))
+            }
+        }
+        InputMode::WavFile => {
+            let Some(path) = input_path else {
+                return Err("missing WAV input path".to_string());
+            };
+            if use_mono {
+                SoundmodemSource::Mono(open_audio_source(&path)?)
+            } else {
+                let src = WavIqSource::open(&path)
+                    .map_err(|err| format!("failed to open IQ WAV input: {err}"))?;
+                SoundmodemSource::Iq(Box::new(src))
+            }
+        }
+    };
+    let sample_rate = source.sample_rate();
+    // A mono FM-audio capture has no IQ front-end; stream it causally. An IQ
+    // capture is accumulated for the survey/replay batch decoder instead.
+    let mono = match source {
+        SoundmodemSource::Mono(_) => {
+            let decoder =
+                SmDecoder::new().ok_or_else(|| "soundmodem decoder alloc failed".to_string())?;
+            let telemetry = TelemetryDecoder::new()
+                .ok_or_else(|| "soundmodem telemetry decoder alloc failed".to_string())?;
+            let resampler = (sample_rate != SM_SAMPLE_RATE)
+                .then(|| StreamResampler::new(sample_rate, SM_SAMPLE_RATE));
+            Some(MonoStream {
+                decoder,
+                telemetry,
+                resampler,
+            })
+        }
+        SoundmodemSource::Iq(_) => None,
+    };
+    Ok(RuntimeInput::Soundmodem {
+        source,
+        sample_rate,
+        iq: Vec::new(),
+        since_decode: 0,
+        mono,
+        processed_samples: 0,
+    })
+}
+
+/// Background worker for a soundmodem IQ capture: receive accumulated IQ
+/// segments and run the (blocking, multi-second) survey/replay decode on each,
+/// emitting frames, so the capture thread never stalls mid-decode. Owns the
+/// dedup set and the frame counter (all soundmodem frames originate here). Bails
+/// as soon as `abort` is set — skipping any queued segments and never emitting
+/// again — so a switched-away session neither wastes work nor leaks stale frames
+/// into the next one.
+fn soundmodem_decode_worker(
+    rx: Receiver<(Vec<IqSample>, u64)>,
+    fs: u32,
+    total_samples: Option<u64>,
+    events: Sender<RxEvent>,
+    start: Instant,
+    abort: Arc<AtomicBool>,
+) {
+    let mut emitted = HashSet::new();
+    let mut count = 0usize;
+    while let Ok((segment, pos)) = rx.recv() {
+        if abort.load(Ordering::SeqCst) {
+            break;
+        }
+        decode_iq_and_emit(
+            &segment,
+            fs,
+            &mut emitted,
+            &events,
+            &start,
+            &mut count,
+            &abort,
+        );
+        // Report progress by decode position: the bar reaches 100% only once
+        // this segment (and thus its frames) is done, so it never sits at 100%
+        // with frames still to come.
+        if !abort.load(Ordering::SeqCst) {
+            let _ = events.send(RxEvent::Progress {
+                processed: pos,
+                total: total_samples,
+            });
+        }
+    }
+}
+
+/// Run the offline survey/replay decoder ([`soundmodem_decode_iq`]) over the
+/// accumulated IQ and emit any frames not already reported. A fresh telemetry
+/// decoder replays every frame in order (so KISS packets that straddle frames
+/// reassemble), but only frames whose payload has not been seen before are sent
+/// — so re-decoding an overlapping rolling window never duplicates a frame.
+fn decode_iq_and_emit(
+    iq: &[IqSample],
+    fs: u32,
+    emitted: &mut HashSet<u64>,
+    events: &Sender<RxEvent>,
+    start: &Instant,
+    count: &mut usize,
+    abort: &AtomicBool,
+) {
+    let frames = soundmodem_decode_iq(iq, fs);
+    if frames.is_empty() {
+        return;
+    }
+    let Some(mut telemetry) = TelemetryDecoder::new() else {
+        return;
+    };
+    for frame in &frames {
+        // The session was switched away while this (long) pass ran: drop its
+        // output so it cannot leak into the next recording's frame list.
+        if abort.load(Ordering::SeqCst) {
+            return;
+        }
+        let fields = telemetry.feed_fields(&frame.data);
+        if !emitted.insert(frame_payload_hash(&frame.data)) {
+            continue;
+        }
+        *count += 1;
+        // Surface the competition KEY the instant the frame carrying it decodes,
+        // so it need not wait for the rest of the capture. (Placeholder until
+        // the KEY format is published; see `detect_key`.)
+        if let Some(key) = detect_key(&frame.data) {
+            let _ = events.send(RxEvent::Dropped(format!("*** KEY DETECTED: {key} ***")));
+        }
+        let row = soundmodem_frame_row(*count, start.elapsed(), frame, &fields);
+        let _ = events.send(RxEvent::Frame(row));
+    }
+}
+
+/// Competition KEY detector: inspect a decoded 223-byte frame for the fixed KEY
+/// format and return the KEY when present, so callers can surface it the moment
+/// it decodes rather than after the whole capture. The format has not been
+/// published yet, so this is a stub returning `None`; fill in the match rule
+/// (magic bytes / field layout) here once it is known and it lights up
+/// end-to-end with no other change.
+fn detect_key(_frame: &[u8]) -> Option<String> {
+    None
+}
+
+/// Stable hash of a decoded frame payload, used to deduplicate frames across
+/// overlapping decode passes.
+fn frame_payload_hash(data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Feed one block of mono audio (`f32` in ±1.0) through the soundmodem decoder
+/// as `i16` PCM, resampling to 48 kHz first when a resampler is attached.
+fn feed_soundmodem_mono(
+    decoder: &mut SmDecoder,
+    resampler: Option<&mut StreamResampler>,
+    samples: &[f32],
+) -> Vec<SmFrame> {
+    let pcm: Vec<i16> = match resampler {
+        Some(rs) => {
+            let block: Vec<Complex32> = samples
+                .iter()
+                .map(|&x| Complex32::new(x * 32767.0, 0.0))
+                .collect();
+            let mut out = Vec::new();
+            rs.process(&block, &mut out);
+            out.iter().map(|c| c.re as i16).collect()
+        }
+        None => samples.iter().map(|&x| (x * 32767.0) as i16).collect(),
+    };
+    decoder.feed_collect(&pcm)
+}
+
+/// Turn newly decoded soundmodem frames into `FrameRow`s (with structured
+/// telemetry) and push them to the GUI.
+fn emit_soundmodem_frames(
+    events: &Sender<RxEvent>,
+    telemetry: &mut TelemetryDecoder,
+    start: &Instant,
+    count: &mut usize,
+    frames: Vec<SmFrame>,
+) {
+    for frame in frames {
+        *count += 1;
+        let fields = telemetry.feed_fields(&frame.data);
+        let row = soundmodem_frame_row(*count, start.elapsed(), &frame, &fields);
+        let _ = events.send(RxEvent::Frame(row));
+    }
+}
+
+/// Build a `FrameRow` directly from a decoded soundmodem frame and its
+/// structured telemetry fields, bypassing the native bit pipeline.
+fn soundmodem_frame_row(
+    index: usize,
+    timestamp: Duration,
+    frame: &SmFrame,
+    fields: &[DecodedField],
+) -> FrameRow {
+    let source = fields
+        .first()
+        .map_or_else(|| "ASRTU-1".to_string(), |f| f.packet.clone());
+    let kind = if fields.is_empty() {
+        FrameKind::Raw
+    } else {
+        FrameKind::Tlm
+    };
+    let telemetry = fields.iter().map(decoded_field_to_telemetry).collect();
+    FrameRow {
+        index,
+        time: timestamp,
+        source,
+        destination: "CCSDS".to_string(),
+        kind,
+        rssi_dbm: None,
+        raw: frame.data.clone(),
+        telemetry,
+    }
+}
+
+/// Convert one soundmodem `DecodedField` into a core `TelemetryField`. A
+/// numeric field parses as `Float` when it carries a decimal point and `Int`
+/// otherwise (falling back to `Text` if the parse fails); enum and hex fields
+/// become `Text`.
+fn decoded_field_to_telemetry(field: &DecodedField) -> TelemetryField {
+    let value = match field.kind {
+        FieldKind::Number if field.value.contains('.') => field.value.parse::<f64>().map_or_else(
+            |_| TelemetryValue::Text(field.value.clone()),
+            TelemetryValue::Float,
+        ),
+        FieldKind::Number => field.value.parse::<i64>().map_or_else(
+            |_| TelemetryValue::Text(field.value.clone()),
+            TelemetryValue::Int,
+        ),
+        FieldKind::Enum | FieldKind::Hex => TelemetryValue::Text(field.value.clone()),
+    };
+    let key = if field.en.is_empty() {
+        field.cn.clone()
+    } else {
+        field.en.clone()
+    };
+    let unit = if field.unit.is_empty() {
+        None
+    } else {
+        Some(field.unit.clone())
+    };
+    TelemetryField {
+        key,
+        group: field.packet.clone(),
+        value,
+        unit,
+        warn: WarnLevel::Ok,
     }
 }
 
@@ -3298,13 +3919,13 @@ fn run_alignment_thread(
     path: PathBuf,
     downlink: DownlinkDef,
     tuning_offset_hz: f32,
-    events: SyncSender<RxEvent>,
+    events: Sender<RxEvent>,
 ) {
     let downlink_id = format!("{downlink:?}");
     let mut source = match WavIqSource::open(&path) {
         Ok(source) => source,
         Err(err) => {
-            let _ = events.try_send(RxEvent::AlignmentFailed(format!(
+            let _ = events.send(RxEvent::AlignmentFailed(format!(
                 "failed to open IQ WAV input: {err}"
             )));
             return;
@@ -3322,7 +3943,7 @@ fn run_alignment_thread(
         let prefix = match read_iq_prefix(&mut source, prefix_len) {
             Ok(prefix) => prefix,
             Err(err) => {
-                let _ = events.try_send(RxEvent::AlignmentFailed(err));
+                let _ = events.send(RxEvent::AlignmentFailed(err));
                 return;
             }
         };
@@ -3332,7 +3953,7 @@ fn run_alignment_thread(
                 .or_else(|| estimate_iq_frequency_offset_hz(&prefix, sample_rate))
                 .filter(|v| v.is_finite());
             if let Some(estimate) = estimate {
-                let _ = events.try_send(RxEvent::Dropped(format!(
+                let _ = events.send(RxEvent::Dropped(format!(
                     "CPM carrier estimate: {estimate:.1} Hz (filename hint: {tuning:.1} Hz)"
                 )));
                 tuning = estimate;
@@ -3351,7 +3972,7 @@ fn run_alignment_thread(
             setup,
             frames: 0,
         };
-        let _ = events.try_send(RxEvent::AlignmentReady(Box::new(cached)));
+        let _ = events.send(RxEvent::AlignmentReady(Box::new(cached)));
         return;
     }
 
@@ -3359,7 +3980,7 @@ fn run_alignment_thread(
     let mut prefix = match read_iq_prefix(&mut source, prefix_len) {
         Ok(prefix) => prefix,
         Err(err) => {
-            let _ = events.try_send(RxEvent::AlignmentFailed(err));
+            let _ = events.send(RxEvent::AlignmentFailed(err));
             return;
         }
     };
@@ -3390,7 +4011,7 @@ fn run_alignment_thread(
 
     let mut scored = score_with(&prefix[..scorer_prefix_len]);
     if matches!(&scored, Some((_, frames)) if *frames == 0) && scorer_prefix_len < prefix.len() {
-        let _ = events.try_send(RxEvent::Dropped(format!(
+        let _ = events.send(RxEvent::Dropped(format!(
             "alignment scorer found 0 frames in {scorer_secs:.1} s slice; retrying with full {} s prefix",
             prefix.len() / sample_rate.max(1) as usize,
         )));
@@ -3400,7 +4021,7 @@ fn run_alignment_thread(
     let (setup, frames) = match scored {
         Some(value) => value,
         None => {
-            let _ = events.try_send(RxEvent::AlignmentFailed(
+            let _ = events.send(RxEvent::AlignmentFailed(
                 "downlink is not a linear-IQ modem".to_string(),
             ));
             return;
@@ -3421,11 +4042,11 @@ fn run_alignment_thread(
         setup,
         frames,
     };
-    let _ = events.try_send(RxEvent::AlignmentReady(Box::new(cached)));
+    let _ = events.send(RxEvent::AlignmentReady(Box::new(cached)));
 }
 
 fn emit_frames<P>(
-    events: &SyncSender<RxEvent>,
+    events: &Sender<RxEvent>,
     satellite: &SatelliteDefinition,
     telemetry: Option<&SchemaParser>,
     start: &Instant,
@@ -3456,7 +4077,7 @@ fn emit_frames<P>(
                 DecodedFrame::Geoscan(geoscan) => {
                     pipeline.record_crc(geoscan.crc_ok);
                     if geoscan.crc_ok {
-                        let _ = events.try_send(RxEvent::ImagePayload(geoscan.payload.clone()));
+                        let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
                     }
                 }
                 DecodedFrame::Ssdv(packet) => {
@@ -3465,7 +4086,7 @@ fn emit_frames<P>(
                         // The SSDV image reassembler re-parses the
                         // header, so it needs the *full* corrected
                         // 256-byte packet rather than just payload.
-                        let _ = events.try_send(RxEvent::ImagePayload(packet.raw.clone()));
+                        let _ = events.send(RxEvent::ImagePayload(packet.raw.clone()));
                     }
                 }
                 _ => {}
@@ -3474,17 +4095,17 @@ fn emit_frames<P>(
         let row = frame_row(*count, start.elapsed(), pipeline, &frame, telemetry);
         match row {
             Ok(row) => {
-                let _ = events.try_send(RxEvent::Frame(row));
+                let _ = events.send(RxEvent::Frame(row));
             }
             Err(err) => {
-                let _ = events.try_send(RxEvent::Dropped(err));
+                let _ = events.send(RxEvent::Dropped(err));
             }
         }
     }
 }
 
 fn emit_decoded_frames(
-    events: &SyncSender<RxEvent>,
+    events: &Sender<RxEvent>,
     satellite: &SatelliteDefinition,
     telemetry: Option<&SchemaParser>,
     start: &Instant,
@@ -3502,16 +4123,16 @@ fn emit_decoded_frames(
         // are still usable, and the reassembler's header_signature
         // check is the real filter.
         if let DecodedFrame::Geoscan(ref geoscan) = decoded {
-            let _ = events.try_send(RxEvent::ImagePayload(geoscan.payload.clone()));
+            let _ = events.send(RxEvent::ImagePayload(geoscan.payload.clone()));
         }
         if let DecodedFrame::Ssdv(ref packet) = decoded {
             // SsdvImageReassembler reads the full corrected wire
             // bytes (sync, header, payload, CRC, parity), so forward
             // the entire packet rather than just `payload`.
-            let _ = events.try_send(RxEvent::ImagePayload(packet.raw.clone()));
+            let _ = events.send(RxEvent::ImagePayload(packet.raw.clone()));
         }
         let row = decoded_frame_row(*count, start.elapsed(), satellite, decoded, telemetry);
-        let _ = events.try_send(RxEvent::Frame(row));
+        let _ = events.send(RxEvent::Frame(row));
     }
 }
 
@@ -4038,6 +4659,7 @@ fn format_telemetry(field: &TelemetryField) -> String {
         TelemetryValue::Float(value) => format!("{value:.2}"),
         TelemetryValue::Int(value) => value.to_string(),
         TelemetryValue::Bool(value) => value.to_string(),
+        TelemetryValue::Text(text) => text.clone(),
         TelemetryValue::Bytes(bytes) => format_hex(bytes),
     };
     match &field.unit {

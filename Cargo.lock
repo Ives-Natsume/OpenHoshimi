@@ -2872,6 +2872,7 @@ dependencies = [
  "openhoshimi-dsp",
  "openhoshimi-io",
  "openhoshimi-runtime",
+ "openhoshimi-soundmodem",
  "openhoshimi-telemetry",
  "png 0.17.16",
  "rfd",

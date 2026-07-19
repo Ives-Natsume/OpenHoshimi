@@ -266,6 +266,10 @@ pub enum TelemetryValue {
     Int(i64),
     /// A boolean value (e.g. a status flag).
     Bool(bool),
+    /// A textual value - an enumeration description, a formatted hex string, or
+    /// any other decoded field that is not a bare number (e.g. soundmodem
+    /// telemetry enum/hex fields).
+    Text(String),
     /// Raw bytes - used for fields whose interpretation is opaque.
     Bytes(Vec<u8>),
 }

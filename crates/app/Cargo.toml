@@ -19,6 +19,7 @@ openhoshimi-codec = { workspace = true }
 openhoshimi-telemetry = { workspace = true }
 openhoshimi-io = { workspace = true }
 openhoshimi-runtime = { workspace = true }
+openhoshimi-soundmodem = { workspace = true }
 eframe = { workspace = true }
 egui_extras = { workspace = true }
 rfd = { workspace = true }
