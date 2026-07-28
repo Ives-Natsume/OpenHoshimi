@@ -1,6 +1,6 @@
-	    ClosedHoshimi - Amateur Satellite Signal Decoder
+	    OpenHoshimi - Amateur Satellite Signal Decoder
 
-ClosedHoshimi is a desktop application and toolkit for decoding telemetry
+OpenHoshimi is a desktop application and toolkit for decoding telemetry
 and data from amateur radio satellites.  It takes IQ recordings, FM-
 demodulated audio, or live soundcard input and produces decoded frames
 with full forward-error-correction where applicable.
@@ -21,7 +21,7 @@ To build the GUI application and all tools:
 
 	cargo build --release
 
-The main binary lands at target/release/closedhoshimi.  Offline decode
+The main binary lands at target/release/OpenHoshimi.  Offline decode
 tools (decode_file, iq_inspect, sat_tool, syncword_scan, cpm_dump) are
 in the same directory.
 
@@ -31,7 +31,7 @@ in the same directory.
 
 Launch the GUI:
 
-	./target/release/closedhoshimi
+	./target/release/OpenHoshimi
 
 Select a satellite from the left panel, choose an input source (WAV/OGG
 file or soundcard), and press Start.  Decoded frames appear in the frame
@@ -120,7 +120,7 @@ assistance.  This keeps it self-contained but means very weak passes
 are bounded by signal-to-noise ratio, not by decoder tuning:
 
   - Strong and moderate recordings decode fully.  On a reference
-    ASRTU-1 (AO-123) BPSK 9k6 pass, ClosedHoshimi recovers 52 CCSDS
+    ASRTU-1 (AO-123) BPSK 9k6 pass, OpenHoshimi recovers 52 CCSDS
     frames end-to-end.
 
   - Recordings whose frame bodies sit at or below the noise floor
@@ -140,7 +140,7 @@ widest bandwidth that still isolates the signal).
 8. License
 ----------
 
-ClosedHoshimi is free software, released under the GNU General Public
+OpenHoshimi is free software, released under the GNU General Public
 License version 3 or later.  See the COPYING file for details.
 
 
