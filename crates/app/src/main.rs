@@ -3749,25 +3749,9 @@ fn decode_iq_and_emit(
             continue;
         }
         *count += 1;
-        // Surface the competition KEY the instant the frame carrying it decodes,
-        // so it need not wait for the rest of the capture. (Placeholder until
-        // the KEY format is published; see `detect_key`.)
-        if let Some(key) = detect_key(&frame.data) {
-            let _ = events.send(RxEvent::Dropped(format!("*** KEY DETECTED: {key} ***")));
-        }
         let row = soundmodem_frame_row(*count, start.elapsed(), frame, &fields);
         let _ = events.send(RxEvent::Frame(row));
     }
-}
-
-/// Competition KEY detector: inspect a decoded 223-byte frame for the fixed KEY
-/// format and return the KEY when present, so callers can surface it the moment
-/// it decodes rather than after the whole capture. The format has not been
-/// published yet, so this is a stub returning `None`; fill in the match rule
-/// (magic bytes / field layout) here once it is known and it lights up
-/// end-to-end with no other change.
-fn detect_key(_frame: &[u8]) -> Option<String> {
-    None
 }
 
 /// Stable hash of a decoded frame payload, used to deduplicate frames across
