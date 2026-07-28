@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "cpm_dump"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "clap",
  "crc",
@@ -1096,7 +1096,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "decode_file"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "clap",
  "openhoshimi-codec",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "iq_inspect"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "clap",
  "openhoshimi-core",
@@ -2862,7 +2862,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openhoshimi-app"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "eframe",
  "egui_extras",
@@ -2881,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-codec"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "crc",
  "openhoshimi-core",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-core"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -2899,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-dsp"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "crc",
  "openhoshimi-core",
@@ -2907,7 +2907,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-io"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "cpal",
  "lewton",
@@ -2917,7 +2917,7 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-runtime"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "crc",
  "openhoshimi-codec",
@@ -2932,14 +2932,14 @@ dependencies = [
 
 [[package]]
 name = "openhoshimi-soundmodem"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "openhoshimi-telemetry"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "openhoshimi-core",
 ]
@@ -3541,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "sat_tool"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "clap",
  "openhoshimi-core",
@@ -3908,7 +3908,7 @@ dependencies = [
 
 [[package]]
 name = "syncword_scan"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "clap",
  "openhoshimi-core",
