@@ -263,16 +263,18 @@ impl JpegBuilder {
         self.height = p.height;
         self.mcu_mode = p.mcu_mode;
         self.quality = p.quality;
-        let raw_mcu = (p.raw[9] as u32) * (p.raw[10] as u32);
-        let (ycparts, mcu_count) = match self.mcu_mode & 3 {
-            0 => (4u8, raw_mcu),
-            1 => (2, raw_mcu * 2),
-            2 => (2, raw_mcu * 2),
-            3 => (1, raw_mcu * 4),
-            _ => (4, raw_mcu),
+        // `SsdvPacket::mcu_count` already includes the sampling-mode
+        // multiplier. Do not re-derive it from `raw[9] * raw[10]`: callers
+        // may use a non-standard packet layout (for example DSLWP 218-byte
+        // packets) where those byte offsets are JPEG payload, not dimensions.
+        let ycparts = match self.mcu_mode & 3 {
+            0 => 4u8,
+            1 | 2 => 2,
+            3 => 1,
+            _ => 4,
         };
         self.ycparts = ycparts;
-        self.mcu_count = mcu_count;
+        self.mcu_count = p.mcu_count;
 
         let dqt0 = scale_dqt(&STD_DQT0, self.quality);
         let dqt1 = scale_dqt(&STD_DQT1, self.quality);
@@ -675,6 +677,7 @@ enum StepResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssdv::{SsdvPacket, SsdvPacketKind};
 
     #[test]
     fn jpeg_encode_int_round_trip() {
@@ -699,5 +702,46 @@ mod tests {
     fn empty_builder_produces_empty_jpeg() {
         let jb = JpegBuilder::new();
         assert!(jb.finish().is_empty());
+    }
+
+    #[test]
+    fn uses_packet_mcu_count_not_raw_dimension_bytes() {
+        // A DSLWP-style caller supplies a 218-byte raw packet. The bytes at
+        // raw[9]/raw[10] are JPEG payload, not width/height codes. The builder
+        // must use `SsdvPacket::mcu_count`, otherwise it pads the JPEG to a
+        // bogus (much larger) MCU count. Keep 0xFF here so the old
+        // raw[9] * raw[10] path produces a value large enough to fail the
+        // size assertion below.
+        let mut raw = vec![0u8; 218];
+        raw[9] = 0xFF;
+        raw[10] = 0xFF;
+        let packet = SsdvPacket {
+            kind: SsdvPacketKind::NoFec,
+            callsign: String::new(),
+            image_id: 1,
+            packet_id: 0,
+            width: 320,
+            height: 240,
+            eoi: true,
+            quality: 4,
+            mcu_mode: 0,
+            mcu_offset: 0,
+            mcu_id: 0,
+            mcu_count: 300,
+            payload: vec![0u8; SsdvPacketKind::NoFec.payload_len()],
+            rs_errors: None,
+            crc_ok: true,
+            raw,
+        };
+
+        let mut builder = JpegBuilder::new();
+        builder.feed_packet(&packet);
+        let jpeg = builder.finish();
+        assert!(!jpeg.is_empty());
+        assert!(
+            jpeg.len() < 50_000,
+            "JPEG was padded to an unexpected size: {} bytes",
+            jpeg.len()
+        );
     }
 }
