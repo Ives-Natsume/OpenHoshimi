@@ -60,9 +60,9 @@ pub struct SsdvPacket {
     pub image_id: u8,
     /// Packet id, 0-based, monotonically increasing within an image.
     pub packet_id: u16,
-    /// Image width in pixels (`packet[9] << 4`).
+    /// Image width in pixels (the header width code times 16).
     pub width: u16,
-    /// Image height in pixels (`packet[10] << 4`).
+    /// Image height in pixels (the header height code times 16).
     pub height: u16,
     /// `true` when this packet carries the JPEG end-of-image marker
     /// (flags byte bit 2).
@@ -80,7 +80,9 @@ pub struct SsdvPacket {
     pub mcu_id: u16,
     /// Total MCU count for the whole image, computed from the
     /// width/height header codes (pixels / 16) and the sampling-mode
-    /// factor. Always in `1..=65535` for decoded packets.
+    /// factor. Always in `1..=65535` for decoded packets. `JpegBuilder`
+    /// does not read this field; it recomputes the count from
+    /// `width`, `height` and `mcu_mode`.
     pub mcu_count: u32,
     /// Payload bytes carrying the JPEG MCU stream slice.
     pub payload: Vec<u8>,
@@ -204,10 +206,10 @@ fn finish_packet(
     if header.width == 0 || header.height == 0 {
         return Err(SsdvDecodeError::ZeroDimensions);
     }
-    // The SSDV specification and reference encoder cap the total MCU
-    // count at 65535. The reference decoder does not enforce the upper
-    // bound, so reject it here before image assembly can pad that many
-    // MCUs.
+    // The SSDV encoder caps the total MCU count at 65535, and the DSLWP
+    // fork of the decoder rejects larger counts. fsphil's original
+    // decoder does not, so enforce it here before image assembly can pad
+    // that many MCUs.
     if header.mcu_count == 0 || header.mcu_count > u32::from(u16::MAX) {
         return Err(SsdvDecodeError::BadMcu);
     }
